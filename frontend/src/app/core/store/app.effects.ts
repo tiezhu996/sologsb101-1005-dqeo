@@ -16,6 +16,7 @@ import {
   listBearings,
   listBridges,
   listPiers,
+  listReadingBatches,
   listReadings,
   listSteps,
   newId,
@@ -55,11 +56,12 @@ export class AppEffects {
             listBearings(),
             listSteps(),
             listReadings(),
+            listReadingBatches(),
             listAcceptances(),
           ]),
         ).pipe(
-          map(([bridges, piers, bearings, steps, readings, acceptances]) =>
-            appDataLoaded({ bridges, piers, bearings, steps, readings, acceptances }),
+          map(([bridges, piers, bearings, steps, readings, readingBatches, acceptances]) =>
+            appDataLoaded({ bridges, piers, bearings, steps, readings, readingBatches, acceptances }),
           ),
           catchError((error: unknown) =>
             from([

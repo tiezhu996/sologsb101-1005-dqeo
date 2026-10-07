@@ -3,13 +3,13 @@
  */
 import { createActionGroup, emptyProps, props } from '@ngrx/store';
 import type { StepDraft, StepState } from '../types/step';
-import type { ReadingRow, StepRow } from '../utils/db';
+import type { ReadingBatchRow, ReadingRow, StepRow } from '../utils/db';
 
 export const stepActions = createActionGroup({
   source: 'step',
   events: {
     'Load': emptyProps(),
-    'Load Success': props<{ steps: StepRow[]; readings: ReadingRow[] }>(),
+    'Load Success': props<{ steps: StepRow[]; readings: ReadingRow[]; readingBatches: ReadingBatchRow[] }>(),
     'Load Failure': props<{ error: string }>(),
 
     'Select Bridge': props<{ bridgeId: string }>(),

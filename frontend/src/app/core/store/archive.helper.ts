@@ -2,9 +2,10 @@
  * 归档判定辅助：检查是否所有支座均已完成四步验收，返回可归档的桥梁摘要。
  * 被 acceptance store 的批量签署 effect 调用。
  */
-import { listAcceptances, listBearings, listBridges, listPiers, listReadings, listSteps } from '../utils/db';
+import { listAcceptances, listBearings, listBridges, listPiers, listReadingBatches, listReadings, listSteps } from '../utils/db';
 import { ACCEPTANCE_STAGES } from '../types/acceptance';
 import { archiveSummary } from '../types/acceptance';
+import { partitionStepReadings } from '../types/control-batch';
 
 export interface ArchiveCheckResult {
   /** 已满足归档条件的桥梁 id */
@@ -15,13 +16,14 @@ export interface ArchiveCheckResult {
 
 /** 检查全部桥梁的归档条件 */
 export async function checkBridgeArchived(): Promise<ArchiveCheckResult> {
-  const [bridges, piers, bearings, acceptances, steps, readings] = await Promise.all([
+  const [bridges, piers, bearings, acceptances, steps, readings, readingBatches] = await Promise.all([
     listBridges(),
     listPiers(),
     listBearings(),
     listAcceptances(),
     listSteps(),
     listReadings(),
+    listReadingBatches(),
   ]);
 
   const archivableBridgeIds: string[] = [];
@@ -45,7 +47,10 @@ export async function checkBridgeArchived(): Promise<ArchiveCheckResult> {
     if (fullyAccepted.length < ownedBearings.length) continue;
 
     const bridgeSteps = steps.filter((item) => item.bridgeId === bridge.id);
-    const stepIds = new Set(bridgeSteps.map((item) => item.id));
+    const effectiveReadingCount = bridgeSteps.reduce(
+      (sum, step) => sum + partitionStepReadings(step.id, readings, readingBatches).effective.length,
+      0,
+    );
     archivableBridgeIds.push(bridge.id);
     summaries.push(
       archiveSummary({
@@ -53,7 +58,7 @@ export async function checkBridgeArchived(): Promise<ArchiveCheckResult> {
         bearingCount: ownedBearings.length,
         totalLiftMm: Number(bridgeSteps.reduce((sum, item) => sum + item.targetLiftMm, 0).toFixed(2)),
         stepCount: bridgeSteps.length,
-        readingCount: readings.filter((item) => stepIds.has(item.stepId)).length,
+        readingCount: effectiveReadingCount,
       }),
     );
   }

@@ -27,6 +27,7 @@ import {
   type AcceptanceView,
 } from '../../../core/types/acceptance';
 import { DISEASE_GRADE_LABEL } from '../../../core/types/bearing';
+import { STEP_STATE_LABEL } from '../../../core/types/step';
 import { ROUTES } from '../../../core/router/app.routes';
 import { acceptanceActions } from '../../../core/store/acceptance.actions';
 import {
@@ -38,6 +39,7 @@ import { selectBridges, selectPiers } from '../../../core/store/bridge.selectors
 import { selectBearings } from '../../../core/store/bearing.selectors';
 import { selectStepStats } from '../../../core/store/step.selectors';
 import { selectStepState } from '../../../core/store/step.selectors';
+import { buildStepViews } from '../../../core/store/step.selectors';
 import { bridgeActions } from '../../../core/store/bridge.actions';
 import {
   DB_NAME,
@@ -62,7 +64,11 @@ import type {
   BearingRow,
   BridgeRow,
   PierRow,
+  ReadingBatchRow,
+  ReadingRow,
+  StepRow,
 } from '../../../core/utils/db';
+import type { StepView } from '../../../core/types/step';
 
 /**
  * /acceptances 分步验收与归档
@@ -137,7 +143,7 @@ import type {
         [value]="stepStats().cumulativeMm"
         [suffix]="'mm'"
         color="#3949ab"
-        [hint]="'共 ' + stepStats().total + ' 级顶升、' + stepStats().readingCount + ' 条读数'"
+        [hint]="'共 ' + stepStats().total + ' 级顶升、' + stepStats().effectiveReadingCount + ' 条读数按控制批口径参与'"
       />
     </div>
 
@@ -265,7 +271,15 @@ import type {
                   <td class="gb-hint">{{ summaryOf(row.id) }}</td>
                   <td>
                     <div class="gb-row-actions">
-                      <button mat-button color="primary" (click)="signOne(row.id, 'lifted')">顶升到位</button>
+                      <button
+                        mat-button
+                        color="primary"
+                        [disabled]="liftedBlockReason(row.id) !== ''"
+                        [matTooltip]="liftedBlockReason(row.id)"
+                        (click)="signOne(row.id, 'lifted')"
+                      >
+                        顶升到位
+                      </button>
                       <button mat-button (click)="signOne(row.id, 'bearingPlaced')">支座就位</button>
                       <button mat-button (click)="signOne(row.id, 'beamLowered')">落梁</button>
                       <button mat-button (click)="signOne(row.id, 'completed')">竣工</button>
@@ -452,9 +466,27 @@ export class AcceptanceArchivePage {
       lifting: 0,
       idle: 0,
       readingCount: 0,
+      effectiveReadingCount: 0,
       maxLimitMm: 0,
     },
   });
+
+  private readonly steps: Signal<StepRow[]> = toSignal(this.store.select((state) => state.step.steps), {
+    initialValue: [] as StepRow[],
+  });
+  private readonly stepReadings: Signal<ReadingRow[]> = toSignal(
+    this.store.select((state) => state.step.readings),
+    { initialValue: [] as ReadingRow[] },
+  );
+  private readonly readingBatches: Signal<ReadingBatchRow[]> = toSignal(
+    this.store.select((state) => state.step.readingBatches),
+    { initialValue: [] as ReadingBatchRow[] },
+  );
+
+  /** 步骤视图（含按控制批口径计算的顶升到位签署闸门） */
+  readonly stepViews: Signal<StepView[]> = computed(() =>
+    buildStepViews(this.steps(), this.stepReadings(), this.readingBatches(), this.bridges()),
+  );
 
   readonly keyword = signal('');
   readonly filters = signal<Record<string, string[]>>({ bridge: [], stage: [], conclusion: [] });
@@ -573,6 +605,11 @@ export class AcceptanceArchivePage {
   }
 
   stageHint(): string {
+    if (this.batchStage() === 'lifted') {
+      const blockedId = this.selected().find((bearingId) => this.liftedBlockReason(bearingId) !== '');
+      if (blockedId) return `顶升到位签署被挡住：${this.liftedBlockReason(blockedId)}`;
+      return '顶升到位签署按控制批口径校验同步偏差与限位告警，当前所选支座均可签署';
+    }
     const passedStages = ACCEPTANCE_STAGES.filter((stage) =>
       this.selected().some((bearingId) => this.passed(bearingId, stage)),
     );
@@ -601,6 +638,13 @@ export class AcceptanceArchivePage {
   }
 
   signOne(bearingId: string, stage: AcceptanceStage): void {
+    if (stage === 'lifted') {
+      const reason = this.liftedBlockReason(bearingId);
+      if (reason) {
+        this.notify(`顶升到位签署被挡住：${reason}`);
+        return;
+      }
+    }
     this.store.dispatch(
       acceptanceActions.bulkSign({
         bearingIds: [bearingId],
@@ -615,9 +659,37 @@ export class AcceptanceArchivePage {
     this.notify(`已签署「${ACCEPTANCE_STAGE_LABEL[stage]}」验收`);
   }
 
+  /**
+   * 顶升到位签署闸门（按支座所属桥梁）：
+   * 与限位告警、步骤校验共用控制批口径——尚有未到位的顶升步骤，
+   * 或已到位步骤在当前控制批口径下超限，都会挡住签署，避免告警与验收结论相反。
+   */
+  liftedBlockReason(bearingId: string): string {
+    const bearing = this.bearings().find((item) => item.id === bearingId);
+    const pier = bearing ? this.piers().find((item) => item.id === bearing.pierId) : undefined;
+    if (!pier) return '支座缺少墩台归属，无法核对顶升步骤';
+    const bridgeSteps = this.stepViews().filter((step) => step.bridgeId === pier.bridgeId);
+    const active = bridgeSteps.filter((step) => step.state !== 'idle' || step.readingCount > 0);
+    if (active.length === 0) return '';
+    const notArrived = active.find((step) => step.state !== 'arrived');
+    if (notArrived) {
+      return `步骤 #${notArrived.seq} 尚未顶升到位（当前：${STEP_STATE_LABEL[notArrived.state]}）`;
+    }
+    const blocked = active.find((step) => step.arrivalBlocked);
+    if (blocked) return `步骤 #${blocked.seq} ${blocked.arrivalBlockReason}`;
+    return '';
+  }
+
   bulkSign(): void {
     const ids = this.selected();
     if (ids.length === 0) return;
+    if (this.batchStage() === 'lifted') {
+      const blockedId = ids.find((bearingId) => this.liftedBlockReason(bearingId) !== '');
+      if (blockedId) {
+        this.notify(`顶升到位签署被挡住：${this.liftedBlockReason(blockedId)}`);
+        return;
+      }
+    }
     this.store.dispatch(
       acceptanceActions.bulkSign({
         bearingIds: ids,
@@ -668,7 +740,7 @@ export class AcceptanceArchivePage {
       bearingCount: this.bearingRows().length,
       totalLiftMm: this.stepStats().cumulativeMm,
       stepCount: this.stepStats().total,
-      readingCount: this.stepStats().readingCount,
+      readingCount: this.stepStats().effectiveReadingCount,
     });
     if (archived) {
       const pierIds = new Set(this.piers().filter((item) => item.bridgeId === bridgeId).map((item) => item.id));

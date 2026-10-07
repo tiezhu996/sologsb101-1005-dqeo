@@ -11,6 +11,7 @@ import type { Pier } from '../types/pier';
 import type { Bearing, DiseaseGrade } from '../types/bearing';
 import type { Step, SyncRequirement } from '../types/step';
 import type { Reading } from '../types/reading';
+import type { ReadingBatch } from '../types/control-batch';
 import type { Acceptance, AcceptanceStage } from '../types/acceptance';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 
@@ -18,7 +19,7 @@ import { ROW_REVISION, type Revisioned } from '../types/persistence';
 export const DB_NAME = 'gbbridgebear';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -28,6 +29,7 @@ export type PierRow = Pier;
 export type BearingRow = Bearing;
 export type StepRow = Step;
 export type ReadingRow = Reading;
+export type ReadingBatchRow = ReadingBatch;
 export type AcceptanceRow = Acceptance;
 
 class BridgeBearingDatabase extends Dexie {
@@ -36,6 +38,7 @@ class BridgeBearingDatabase extends Dexie {
   bearings!: Table<BearingRow, string>;
   steps!: Table<StepRow, string>;
   readings!: Table<ReadingRow, string>;
+  readingBatches!: Table<ReadingBatchRow, string>;
   acceptances!: Table<AcceptanceRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
 
@@ -100,6 +103,19 @@ class BridgeBearingDatabase extends Dexie {
           if (typeof row.targetLiftMm !== 'number' && typeof row.lift === 'number') row.targetLiftMm = row.lift;
         });
       });
+
+    // v3：新增控制批表 readingBatches，读数补充 batchId 索引。
+    //     旧数据不补控制批——旧步骤沿用全部读数，只有新提交才按「本批为准 / 并入历史」择口径。
+    this.version(DB_SCHEMA_VERSION).stores({
+      bridges: 'id, name, bridgeType, builtYear, roadClass, archived',
+      piers: 'id, bridgeId, code, capElevation, [bridgeId+code]',
+      bearings: 'id, pierId, diseaseGrade, type, serial, [pierId+serial]',
+      steps: 'id, bridgeId, seq, state, syncRequirement, [bridgeId+seq]',
+      readings: 'id, stepId, pointCode, recordedAt, batchId, [stepId+pointCode], [stepId+batchId]',
+      readingBatches: 'id, stepId, recordedAt, mode, [stepId+recordedAt]',
+      acceptances: 'id, bearingId, stage, conclusion, [bearingId+stage]',
+      settings: 'id',
+    });
   }
 }
 
@@ -229,6 +245,7 @@ async function seedDatabase(): Promise<void> {
   const bearings: BearingRow[] = [];
   const steps: StepRow[] = [];
   const readings: ReadingRow[] = [];
+  const readingBatches: ReadingBatchRow[] = [];
   const acceptances: AcceptanceRow[] = [];
 
   const operators = ['陈立强', '赵启明', '李清和', '周文斌'];
@@ -314,34 +331,56 @@ async function seedDatabase(): Promise<void> {
       const pointCount = stepSpec.sync === 'single' ? 1 : 4;
       const rounds = stepSpec.state === 'arrived' ? 3 : 2;
       for (let round = 0; round < rounds; round += 1) {
+        const roundTime = dateTimeText(0, 9 + round, 5);
+        const roundOperator = operators[(stepIndex + round) % operators.length];
+        // 历史轮次挂在既有控制批下：越早的轮次越旧，最新一轮即当前控制批。
+        // 最新一轮默认「本批为准」（现场告警盯最新状态）；沙河大桥已到位首步演示「并入历史」。
+        const isLatestRound = round === rounds - 1;
+        const batchId = `batch-${stepId}-${round + 1}`;
+        const mode: ReadingBatchRow['mode'] =
+          isLatestRound && bridgeSpec.name === '沙河大桥' && stepSpec.state === 'arrived' ? 'merge' : 'batch';
+        const roundReadings: ReadingRow[] = [];
         for (let point = 0; point < pointCount; point += 1) {
           const base = stepSpec.targetLiftMm * ((round + 1) / (rounds + 1));
           const jitter = (random() - 0.5) * 1.4;
-          readings.push({
+          roundReadings.push({
             id: `read-${stepId}-${round + 1}-${point + 1}`,
             stepId,
             pointCode: `P${point + 1}`,
             displacementMm: Number((base + jitter).toFixed(2)),
             stressMpa: Number((7 + random() * 6).toFixed(2)),
-            recordedAt: dateTimeText(0, 9 + round, 5 + point * 5),
-            operator: operators[(stepIndex + round) % operators.length],
+            recordedAt: roundTime,
+            operator: roundOperator,
+            batchId,
             createdAt: stamp,
             revision: ROW_REVISION,
           });
         }
+        readings.push(...roundReadings);
+        readingBatches.push({
+          id: batchId,
+          stepId,
+          recordedAt: roundTime,
+          operator: roundOperator,
+          mode,
+          readingCount: roundReadings.length,
+          createdAt: stamp,
+          revision: ROW_REVISION,
+        });
       }
     });
   });
 
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.readingBatches, db.acceptances],
     async () => {
       await db.bridges.bulkPut(bridges);
       await db.piers.bulkPut(piers);
       await db.bearings.bulkPut(bearings);
       await db.steps.bulkPut(steps);
       await db.readings.bulkPut(readings);
+      await db.readingBatches.bulkPut(readingBatches);
       await db.acceptances.bulkPut(acceptances);
     },
   );
@@ -381,7 +420,10 @@ export async function removeBridge(id: string): Promise<void> {
       const stepRows = await db.steps.where('bridgeId').equals(id).toArray();
       const stepIds = stepRows.map((item) => item.id);
       if (bearingIds.length) await db.acceptances.where('bearingId').anyOf(bearingIds).delete();
-      if (stepIds.length) await db.readings.where('stepId').anyOf(stepIds).delete();
+      if (stepIds.length) {
+        await db.readings.where('stepId').anyOf(stepIds).delete();
+        await db.readingBatches.where('stepId').anyOf(stepIds).delete();
+      }
       await db.steps.where('bridgeId').equals(id).delete();
       if (pierIds.length) await db.bearings.where('pierId').anyOf(pierIds).delete();
       await db.piers.where('bridgeId').equals(id).delete();
@@ -447,8 +489,9 @@ export async function putSteps(rows: StepRow[]): Promise<void> {
 }
 
 export async function removeStep(id: string): Promise<void> {
-  await db.transaction('rw', [db.steps, db.readings], async () => {
+  await db.transaction('rw', [db.steps, db.readings, db.readingBatches], async () => {
     await db.readings.where('stepId').equals(id).delete();
+    await db.readingBatches.where('stepId').equals(id).delete();
     await db.steps.delete(id);
   });
 }
@@ -469,6 +512,49 @@ export async function putReadings(rows: ReadingRow[]): Promise<void> {
 
 export async function removeReading(id: string): Promise<void> {
   await db.readings.delete(id);
+}
+
+/* ============================ 控制批 ============================ */
+
+export async function listReadingBatches(): Promise<ReadingBatchRow[]> {
+  return db.readingBatches.toArray();
+}
+
+export async function putReadingBatch(row: ReadingBatchRow): Promise<void> {
+  await db.readingBatches.put(row);
+}
+
+export async function removeReadingBatch(id: string): Promise<void> {
+  await db.transaction('rw', [db.readings, db.readingBatches], async () => {
+    await db.readings.where('batchId').equals(id).delete();
+    await db.readingBatches.delete(id);
+  });
+}
+
+/** 一次批量提交：写入控制批与批内读数（同一事务，避免口径与读数脱节） */
+export async function submitReadingBatch(input: {
+  batch: ReadingBatchRow;
+  readings: ReadingRow[];
+}): Promise<void> {
+  await db.transaction('rw', [db.readings, db.readingBatches], async () => {
+    await db.readingBatches.put(input.batch);
+    await db.readings.bulkPut(input.readings);
+  });
+}
+
+/**
+ * 删除单条读数；若它是控制批内最后一条读数，则一并删除该控制批，
+ * 使步骤回退到上一控制批（或旧步骤全部读数口径）。
+ */
+export async function removeReadingWithBatch(id: string): Promise<void> {
+  await db.transaction('rw', [db.readings, db.readingBatches], async () => {
+    const target = await db.readings.get(id);
+    await db.readings.delete(id);
+    if (target?.batchId) {
+      const remaining = await db.readings.where('batchId').equals(target.batchId).count();
+      if (remaining === 0) await db.readingBatches.delete(target.batchId);
+    }
+  });
 }
 
 /* ============================= 验收 ============================= */
@@ -496,16 +582,18 @@ export interface DatabaseSnapshot {
   bearings: Bearing[];
   steps: Step[];
   readings: Reading[];
+  readingBatches: ReadingBatch[];
   acceptances: Acceptance[];
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [bridges, piers, bearings, steps, readings, acceptances] = await Promise.all([
+  const [bridges, piers, bearings, steps, readings, readingBatches, acceptances] = await Promise.all([
     listBridges(),
     listPiers(),
     listBearings(),
     listSteps(),
     listReadings(),
+    listReadingBatches(),
     listAcceptances(),
   ]);
   return {
@@ -517,6 +605,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     bearings,
     steps,
     readings,
+    readingBatches,
     acceptances,
   };
 }
@@ -524,7 +613,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.readingBatches, db.acceptances],
     async () => {
       await Promise.all([
         db.bridges.clear(),
@@ -532,6 +621,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.bearings.clear(),
         db.steps.clear(),
         db.readings.clear(),
+        db.readingBatches.clear(),
         db.acceptances.clear(),
       ]);
       await db.bridges.bulkPut(snapshot.bridges ?? []);
@@ -539,6 +629,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.bearings.bulkPut(snapshot.bearings ?? []);
       await db.steps.bulkPut(snapshot.steps ?? []);
       await db.readings.bulkPut(snapshot.readings ?? []);
+      await db.readingBatches.bulkPut(snapshot.readingBatches ?? []);
       await db.acceptances.bulkPut(snapshot.acceptances ?? []);
     },
   );
@@ -548,7 +639,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.readingBatches, db.acceptances],
     async () => {
       await Promise.all([
         db.bridges.clear(),
@@ -556,6 +647,7 @@ export async function resetDatabase(): Promise<void> {
         db.bearings.clear(),
         db.steps.clear(),
         db.readings.clear(),
+        db.readingBatches.clear(),
         db.acceptances.clear(),
       ]);
     },
@@ -565,15 +657,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [bridges, piers, bearings, steps, readings, acceptances] = await Promise.all([
+  const [bridges, piers, bearings, steps, readings, readingBatches, acceptances] = await Promise.all([
     db.bridges.count(),
     db.piers.count(),
     db.bearings.count(),
     db.steps.count(),
     db.readings.count(),
+    db.readingBatches.count(),
     db.acceptances.count(),
   ]);
-  return { bridges, piers, bearings, steps, readings, acceptances };
+  return { bridges, piers, bearings, steps, readings, readingBatches, acceptances };
 }
 
 /** 结构版本信息 */

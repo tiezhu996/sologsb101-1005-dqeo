@@ -2,24 +2,36 @@
  * 顶升步骤时间线服务（Angular 以 Injectable 实现 useStepTimeline 语义）
  * 提供顶升步骤时间线、累计顶升量与同步偏差的 RxJS 派生流，
  * 被顶升步骤页、测点读数页消费。
+ * 全部监测派生指标按控制批口径计算（本批为准 / 并入历史 / 旧步骤全部读数）。
  */
 import { Injectable, inject } from '@angular/core';
 import { Observable, combineLatest, map, shareReplay } from 'rxjs';
 import { IdbTableService } from './idb-table.service';
-import { listBearings, listBridges, listReadings, listSteps } from '../utils/db';
-import type { BridgeRow, BearingRow, ReadingRow, StepRow } from '../utils/db';
-import { sortSteps, SYNC_REQUIREMENT_LABEL, type StepView } from '../types/step';
+import { listBearings, listBridges, listReadingBatches, listReadings, listSteps } from '../utils/db';
+import type {
+  BridgeRow,
+  BearingRow,
+  ReadingBatchRow,
+  ReadingRow,
+  StepRow,
+} from '../utils/db';
+import { sortSteps, SYNC_REQUIREMENT_LABEL, arrivalGateReason, type StepView } from '../types/step';
+import {
+  CONTROL_MODE_LABEL,
+  partitionStepReadings,
+  type StepReadingPartition,
+} from '../types/control-batch';
 import { meanDisplacement, syncDeviationMm, type ReadingView } from '../types/reading';
 import { overallLevel, syncLevel, type ToleranceLevel } from '../utils/tolerance';
 
 /** 步骤时间线的一级节点 */
 export interface StepTimelineNode {
   step: StepView;
-  /** 该步骤的读数（含偏差） */
+  /** 该步骤的读数（含偏差与留档标记） */
   readings: ReadingView[];
   /** 同步偏差等级 */
   deviationLevel: ToleranceLevel;
-  /** 综合限位等级 */
+  /** 综合限位等级（仅参与控制批口径的读数） */
   limitLevel: ToleranceLevel;
 }
 
@@ -27,6 +39,7 @@ export interface StepTimelineNode {
 export interface StepTimelineSnapshot {
   steps: StepRow[];
   readings: ReadingRow[];
+  readingBatches: ReadingBatchRow[];
   bearings: BearingRow[];
   bridges: BridgeRow[];
 }
@@ -39,15 +52,16 @@ export class StepTimelineService {
   readonly snapshot$: Observable<StepTimelineSnapshot> = this.idb
     .watch<StepTimelineSnapshot>(
       async () => {
-        const [steps, readings, bearings, bridges] = await Promise.all([
+        const [steps, readings, readingBatches, bearings, bridges] = await Promise.all([
           listSteps(),
           listReadings(),
+          listReadingBatches(),
           listBearings(),
           listBridges(),
         ]);
-        return { steps, readings, bearings, bridges };
+        return { steps, readings, readingBatches, bearings, bridges };
       },
-      { steps: [], readings: [], bearings: [], bridges: [] },
+      { steps: [], readings: [], readingBatches: [], bearings: [], bridges: [] },
     )
     .pipe(shareReplay({ bufferSize: 1, refCount: true }));
 
@@ -65,40 +79,49 @@ export class StepTimelineService {
     map(([steps, snapshot]) => {
       const bridges = new Map(snapshot.bridges.map((item) => [item.id, item.name]));
       return steps.map((step) => {
+        const partition = partitionStepReadings(step.id, snapshot.readings, snapshot.readingBatches);
+        const effectiveIds = new Set(partition.effective.map((item) => item.id));
+        const average = meanDisplacement(partition.effective);
+        const controlLabel = partition.legacy
+          ? '旧步骤全部读数'
+          : CONTROL_MODE_LABEL[partition.controlBatch!.mode];
         const stepReadings = snapshot.readings
           .filter((item) => item.stepId === step.id)
-          .sort((a, b) => a.recordedAt.localeCompare(b.recordedAt))
+          .sort((a, b) => b.recordedAt.localeCompare(a.recordedAt))
           .map<ReadingView>((reading) => {
-            const sameRound = snapshot.readings.filter(
-              (item) => item.stepId === reading.stepId && item.recordedAt === reading.recordedAt,
-            );
-            const average = meanDisplacement(sameRound);
+            const inControl = effectiveIds.has(reading.id);
             return {
               ...reading,
               stepSeq: step.seq,
               bridgeId: step.bridgeId,
               bridgeName: bridges.get(step.bridgeId) ?? '未归属桥梁',
               syncRequirement: SYNC_REQUIREMENT_LABEL[step.syncRequirement],
-              deviationMm: Number((reading.displacementMm - average).toFixed(3)),
-              overLimit: Math.abs(reading.displacementMm) >= step.limitMm,
-              stressAlert: reading.stressMpa >= 12,
+              deviationMm: inControl ? Number((reading.displacementMm - average).toFixed(3)) : 0,
+              overLimit: inControl && Math.abs(reading.displacementMm) >= step.limitMm,
+              stressAlert: inControl && reading.stressMpa >= 12,
+              inControl,
+              controlLabel: inControl ? controlLabel : '已留档',
             };
           });
         return {
           step,
           readings: stepReadings,
           deviationLevel: syncLevel(step.syncDeviationMm ?? 0),
-          limitLevel: stepReadings.reduce<ToleranceLevel>((worst, reading) => {
-            const level = overallLevel(reading.displacementMm, step.limitMm, reading.stressMpa);
-            if (level === 'exceed' || worst === 'exceed') return 'exceed';
-            if (level === 'watch' || worst === 'watch') return 'watch';
-            return 'ok';
-          }, 'ok'),
+          limitLevel: this.worstLevel(partition, step.limitMm),
         };
       });
     }),
     shareReplay({ bufferSize: 1, refCount: true }),
   );
+
+  private worstLevel(partition: StepReadingPartition, limitMm: number): ToleranceLevel {
+    return partition.effective.reduce<ToleranceLevel>((worst, reading) => {
+      const level = overallLevel(reading.displacementMm, limitMm, reading.stressMpa);
+      if (level === 'exceed' || worst === 'exceed') return 'exceed';
+      if (level === 'watch' || worst === 'watch') return 'watch';
+      return 'ok';
+    }, 'ok');
+  }
 
   /** 按桥梁分组的步骤流 */
   readonly stepsByBridge$: Observable<Map<string, StepView[]>> = this.stepViews$.pipe(
@@ -126,13 +149,14 @@ export class StepTimelineService {
     shareReplay({ bufferSize: 1, refCount: true }),
   );
 
-  /** 同步偏差流：步骤 id → 偏差 */
+  /** 同步偏差流：步骤 id → 偏差（控制批口径） */
   readonly syncDeviation$: Observable<Record<string, number>> = this.snapshot$.pipe(
     map((snapshot) => {
       const result: Record<string, number> = {};
       for (const step of snapshot.steps) {
-        const rows = snapshot.readings.filter((item) => item.stepId === step.id);
-        result[step.id] = syncDeviationMm(rows);
+        result[step.id] = syncDeviationMm(
+          partitionStepReadings(step.id, snapshot.readings, snapshot.readingBatches).effective,
+        );
       }
       return result;
     }),
@@ -150,22 +174,38 @@ export class StepTimelineService {
       cumulative.set(step.id, Number(running.toFixed(2)));
     }
     return ordered.map((step) => {
-      const rows = snapshot.readings.filter((item) => item.stepId === step.id);
+      const partition = partitionStepReadings(step.id, snapshot.readings, snapshot.readingBatches);
       const cumulativeLiftMm = cumulative.get(step.id) ?? step.targetLiftMm;
-      const deviation = rows.length > 0 ? syncDeviationMm(rows) : null;
+      const deviation = partition.effective.length > 0 ? syncDeviationMm(partition.effective) : null;
       const overLimit = cumulativeLiftMm > step.limitMm;
+      const caliber = partition.legacy
+        ? '旧步骤全部读数'
+        : CONTROL_MODE_LABEL[partition.controlBatch!.mode];
+      const blockReason = arrivalGateReason({
+        effectiveRows: partition.effective,
+        deviationMm: deviation,
+        limitMm: step.limitMm,
+      });
       return {
         ...step,
         bridgeName: bridgeName.get(step.bridgeId) ?? '未归属桥梁',
         cumulativeLiftMm,
         overLimit,
-        readingCount: rows.length,
+        readingCount: snapshot.readings.filter((item) => item.stepId === step.id).length,
+        effectiveReadingCount: partition.effective.length,
         syncDeviationMm: deviation,
+        controlMode: partition.controlBatch?.mode ?? null,
+        controlBatchAt: partition.controlBatch?.recordedAt ?? null,
+        limitExceedCount: partition.effective.filter(
+          (item) => step.limitMm > 0 && Math.abs(item.displacementMm) >= step.limitMm,
+        ).length,
+        arrivalBlocked: blockReason !== '',
+        arrivalBlockReason: blockReason,
         validation: overLimit
           ? `累计顶升量 ${cumulativeLiftMm} mm 已超过限位 ${step.limitMm} mm，需立即停止并复核`
           : deviation !== null && syncLevel(deviation) === 'exceed'
-            ? `同步偏差 ${deviation.toFixed(2)} mm 超允许值，需调平后继续`
-            : '顶升参数与监测数据均在控制范围内',
+            ? `同步偏差 ${deviation.toFixed(2)} mm 超允许值，需调平后继续（${caliber}）`
+            : `顶升参数与${caliber}监测数据均在控制范围内`,
       };
     });
   }

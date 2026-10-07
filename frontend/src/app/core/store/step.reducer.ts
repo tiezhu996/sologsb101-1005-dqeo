@@ -1,11 +1,12 @@
 import { createReducer, on } from '@ngrx/store';
 import { stepActions } from './step.actions';
 import { appDataFailed, appDataLoaded } from './app.actions';
-import type { ReadingRow, StepRow } from '../utils/db';
+import type { ReadingBatchRow, ReadingRow, StepRow } from '../utils/db';
 
 export interface StepStateSlice {
   steps: StepRow[];
   readings: ReadingRow[];
+  readingBatches: ReadingBatchRow[];
   activeBridgeId: string | null;
   loading: boolean;
   error: string;
@@ -14,6 +15,7 @@ export interface StepStateSlice {
 export const initialStepState: StepStateSlice = {
   steps: [],
   readings: [],
+  readingBatches: [],
   activeBridgeId: null,
   loading: false,
   error: '',
@@ -22,21 +24,23 @@ export const initialStepState: StepStateSlice = {
 export const stepReducer = createReducer(
   initialStepState,
   on(stepActions.load, (state) => ({ ...state, loading: true, error: '' })),
-  on(stepActions.loadSuccess, (state, { steps, readings }) => ({
+  on(stepActions.loadSuccess, (state, { steps, readings, readingBatches }) => ({
     ...state,
     loading: false,
     steps: [...steps].sort((a, b) => a.seq - b.seq),
     readings,
+    readingBatches,
   })),
   on(stepActions.loadFailure, (state, { error }) => ({ ...state, loading: false, error })),
   on(stepActions.selectBridge, (state, { bridgeId }) => ({ ...state, activeBridgeId: bridgeId })),
   on(stepActions.writeFailure, (state, { error }) => ({ ...state, error })),
-  on(appDataLoaded, (state, { steps, readings }) => ({
+  on(appDataLoaded, (state, { steps, readings, readingBatches }) => ({
     ...state,
     loading: false,
     error: '',
     steps: [...steps].sort((a, b) => a.seq - b.seq),
     readings,
+    readingBatches,
   })),
   on(appDataFailed, (state, { error }) => ({ ...state, loading: false, error })),
 );

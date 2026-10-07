@@ -15,6 +15,8 @@ export interface Reading extends RowMeta {
   recordedAt: string;
   /** 记录人 */
   operator: string;
+  /** 所属控制批；旧读数（迁移 / 旧步骤）无此字段，沿用全部读数口径 */
+  batchId?: string;
 }
 
 /** 测点读数表单草稿 */
@@ -39,6 +41,10 @@ export interface ReadingView extends Reading {
   overLimit: boolean;
   /** 应力是否超过关注值 */
   stressAlert: boolean;
+  /** 是否属于当前控制批口径下参与计算的读数（false 表示仅留档） */
+  inControl: boolean;
+  /** 口径标签：本批为准 / 并入历史 / 旧步骤全部读数 / 已留档 */
+  controlLabel: string;
 }
 
 /** 同一步骤的批量录入行 */

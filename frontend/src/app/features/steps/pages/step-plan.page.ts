@@ -28,6 +28,7 @@ import {
   type StepView,
   type SyncRequirement,
 } from '../../../core/types/step';
+import { CONTROL_MODE_LABEL } from '../../../core/types/control-batch';
 import { ROUTES } from '../../../core/router/app.routes';
 import { stepActions } from '../../../core/store/step.actions';
 import {
@@ -43,7 +44,7 @@ import { TOLERANCE_HEX, TOLERANCE_LEVEL_LABEL } from '../../../core/utils/tolera
 import { StatBadgeComponent } from '../../../shared/components/common/stat-badge.component';
 import { EmptyPanelComponent } from '../../../shared/components/common/empty-panel.component';
 import { FilterBarComponent, type FilterSelectSpec } from '../../../shared/components/common/filter-bar.component';
-import type { BridgeRow, ReadingRow, StepRow } from '../../../core/utils/db';
+import type { BridgeRow, ReadingBatchRow, ReadingRow, StepRow } from '../../../core/utils/db';
 import type { ToleranceLevel } from '../../../core/utils/tolerance';
 
 /** 顶升步骤表单对话框数据 */
@@ -195,7 +196,7 @@ export class StepDialogComponent {
         [value]="stats().readingCount"
         [suffix]="'条'"
         color="#3949ab"
-        hint="同步偏差按步骤内读数极差计算"
+        [hint]="'其中 ' + stats().effectiveReadingCount + ' 条按控制批口径参与计算，其余仅留档'"
       />
     </div>
 
@@ -267,13 +268,19 @@ export class StepDialogComponent {
                 </td>
                 <td>
                   {{ step.readingCount }} 条
+                  <div class="gb-hint">{{ caliberText(step) }}</div>
                   @if (step.syncDeviationMm !== null) {
                     <span [style.color]="levelColor(step)">
                       / 偏差 {{ formatMm(step.syncDeviationMm) }}（{{ levelLabel(step) }}）
                     </span>
                   }
                 </td>
-                <td class="gb-hint">{{ step.validation }}</td>
+                <td class="gb-hint">
+                  {{ step.validation }}
+                  @if (step.state !== 'arrived' && step.arrivalBlocked) {
+                    <div [style.color]="'#c62828'">到位签署被挡住：{{ step.arrivalBlockReason }}</div>
+                  }
+                </td>
                 <td>
                   <div class="gb-row-actions">
                     <button mat-button [disabled]="$first" (click)="move(step, -1)">
@@ -283,7 +290,13 @@ export class StepDialogComponent {
                       <mat-icon>arrow_downward</mat-icon>
                     </button>
                     @for (next of nextStates(step.state); track next) {
-                      <button mat-button color="primary" (click)="advance(step, next)">
+                      <button
+                        mat-button
+                        color="primary"
+                        [disabled]="next === 'arrived' && step.arrivalBlocked"
+                        [matTooltip]="next === 'arrived' && step.arrivalBlocked ? step.arrivalBlockReason : ''"
+                        (click)="advance(step, next)"
+                      >
                         <mat-icon>play_arrow</mat-icon>
                         {{ stepStateLabel[next] }}
                       </button>
@@ -373,6 +386,7 @@ export class StepPlanPage {
   readonly ROUTES = ROUTES;
   readonly syncRequirementLabel = SYNC_REQUIREMENT_LABEL;
   readonly stepStateLabel = STEP_STATE_LABEL;
+  readonly controlModeLabel = CONTROL_MODE_LABEL;
   readonly formatLift = formatLift;
   readonly formatMm = formatMm;
 
@@ -386,6 +400,10 @@ export class StepPlanPage {
     this.store.select((state) => state.step.readings),
     { initialValue: [] as ReadingRow[] },
   );
+  private readonly readingBatches: Signal<ReadingBatchRow[]> = toSignal(
+    this.store.select((state) => state.step.readingBatches),
+    { initialValue: [] as ReadingBatchRow[] },
+  );
   readonly activeBridgeId = toSignal(this.store.select((state) => state.step.activeBridgeId), {
     initialValue: null as string | null,
   });
@@ -398,6 +416,7 @@ export class StepPlanPage {
       lifting: 0,
       idle: 0,
       readingCount: 0,
+      effectiveReadingCount: 0,
       maxLimitMm: 0,
     },
   });
@@ -409,7 +428,7 @@ export class StepPlanPage {
   readonly stepAverages = toSignal(this.store.select(selectStepAverages), { initialValue: {} });
 
   readonly stepViews: Signal<StepView[]> = computed(() =>
-    buildStepViews(this.steps(), this.readings(), this.bridges()),
+    buildStepViews(this.steps(), this.readings(), this.readingBatches(), this.bridges()),
   );
 
   readonly keyword = signal('');
@@ -526,9 +545,20 @@ export class StepPlanPage {
     this.notify(`步骤 #${step.seq} 已${direction === -1 ? '上移' : '下移'}`);
   }
 
+  /** 推进状态；顶升到位签署按控制批口径校验同步偏差与限位告警 */
   advance(step: StepView, next: StepState): void {
+    if (next === 'arrived' && step.arrivalBlocked) {
+      this.notify(`顶升到位签署被挡住：${step.arrivalBlockReason}`);
+      return;
+    }
     this.store.dispatch(stepActions.advanceState({ id: step.id, next }));
     this.notify(`步骤 #${step.seq} 已推进为${STEP_STATE_LABEL[next]}`);
+  }
+
+  /** 步骤的控制批口径文案 */
+  caliberText(step: StepView): string {
+    if (step.controlMode === null) return '旧步骤 · 沿用全部读数';
+    return `${this.controlModeLabel[step.controlMode]} · 当前批 ${step.controlBatchAt ?? '-'}（${step.effectiveReadingCount}/${step.readingCount} 条参与）`;
   }
 
   openDialog(step: StepView | null): void {

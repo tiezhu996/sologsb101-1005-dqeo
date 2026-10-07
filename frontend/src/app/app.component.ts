@@ -199,6 +199,7 @@ export class AppComponent implements OnInit {
       lifting: 0,
       idle: 0,
       readingCount: 0,
+      effectiveReadingCount: 0,
       maxLimitMm: 0,
     },
   });

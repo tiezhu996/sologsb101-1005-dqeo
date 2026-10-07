@@ -14,6 +14,13 @@ import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { STEP_STATE_LABEL, SYNC_REQUIREMENT_LABEL, type StepView } from '../../../core/types/step';
 import {
+  CONTROL_MODE_HINT,
+  CONTROL_MODE_LABEL,
+  CONTROL_MODES,
+  partitionStepReadings,
+  type ControlMode,
+} from '../../../core/types/control-batch';
+import {
   POINT_CODES,
   STRESS_ALERT_MPA,
   meanDisplacement,
@@ -27,7 +34,14 @@ import { stepActions } from '../../../core/store/step.actions';
 import { buildStepViews, selectStepStats } from '../../../core/store/step.selectors';
 import { selectBridges } from '../../../core/store/bridge.selectors';
 import { IdbTableService } from '../../../core/services/idb-table.service';
-import { putReadings, rowMeta, newId, type ReadingRow } from '../../../core/utils/db';
+import {
+  newId,
+  removeReadingWithBatch,
+  rowMeta,
+  submitReadingBatch,
+  type ReadingBatchRow,
+  type ReadingRow,
+} from '../../../core/utils/db';
 import { formatMm, formatStress } from '../../../core/utils/unit';
 import {
   TOLERANCE_HEX,
@@ -99,21 +113,21 @@ interface BatchRow {
         title="当前步骤平均位移"
         [value]="formatMm(currentAverage())"
         color="#00897b"
-        [hint]="selectedStepLabel()"
+        [hint]="currentCaliberText()"
       />
       <app-stat-badge
         title="同步偏差"
         [value]="formatMm(currentDeviation())"
         [percent]="deviationShare()"
         [color]="syncColor()"
-        [hint]="'允许值 1.5 mm，当前 ' + syncLevelText()"
+        [hint]="currentCaliberText() + '；允许值 1.5 mm，当前 ' + syncLevelText()"
       />
       <app-stat-badge
-        title="超限读数"
+        title="超限读数（参与口径）"
         [value]="exceedCount()"
         [suffix]="'条'"
         color="#c62828"
-        [hint]="'限位值 ' + (selectedStep()?.limitMm ?? 0) + ' mm，应力关注值 ' + stressAlert + ' MPa'"
+        [hint]="'限位值 ' + (selectedStep()?.limitMm ?? 0) + ' mm，应力关注值 ' + stressAlert + ' MPa；留档读数不计告警'"
       />
     </div>
 
@@ -166,6 +180,14 @@ interface BatchRow {
                 (ngModelChange)="recordedAt.set($event)"
               />
             </mat-form-field>
+            <mat-form-field appearance="outline" style="min-width: 170px">
+              <mat-label>本批提交口径</mat-label>
+              <mat-select [ngModel]="controlMode()" (ngModelChange)="controlMode.set($event)">
+                @for (mode of controlModes; track mode) {
+                  <mat-option [value]="mode">{{ controlModeLabel[mode] }}</mat-option>
+                }
+              </mat-select>
+            </mat-form-field>
             <button mat-stroked-button (click)="regenerateRows()">
               <mat-icon>autorenew</mat-icon>
               重排测点
@@ -176,6 +198,8 @@ interface BatchRow {
             </button>
           </div>
           <div class="gb-hint">{{ dateHint() }}</div>
+          <div class="gb-hint">{{ controlModeHint() }}</div>
+          <div class="gb-hint">当前口径：{{ currentCaliberText() }}</div>
 
           @if (selectedStep(); as step) {
             <div class="gb-table-wrap" style="margin-top: 10px">
@@ -230,6 +254,9 @@ interface BatchRow {
                 <div class="gb-hint">
                   本批 {{ batchRows().length }} 个测点，平均位移 {{ formatMm(batchAverage()) }}；{{ limitAlertText(batchMax(), step.limitMm) }}
                 </div>
+                <div class="gb-hint">
+                  提交后成为步骤 #{{ step.seq }} 的最新控制批；选择「本批为准」时，现场告警、步骤校验与顶升到位签署只看本批，历史读数仅留档可查。
+                </div>
               </div>
             </div>
           } @else {
@@ -266,25 +293,31 @@ interface BatchRow {
                 <th>应力</th>
                 <th>记录时间</th>
                 <th>记录人</th>
+                <th>口径</th>
                 <th>判定</th>
                 <th style="width: 90px">操作</th>
               </tr>
             </thead>
             <tbody>
               @for (reading of filtered(); track reading.id) {
-                <tr>
+                <tr [style.opacity]="reading.inControl ? 1 : 0.62">
                   <td>#{{ reading.stepSeq }}</td>
                   <td>{{ reading.bridgeName }}</td>
                   <td class="gb-mono">{{ reading.pointCode }}</td>
                   <td>{{ formatMm(reading.displacementMm) }}</td>
-                  <td [style.color]="reading.deviationMm === 0 ? '#2e7d32' : '#ed6c02'">
-                    {{ formatMm(reading.deviationMm) }}
+                  <td [style.color]="!reading.inControl ? '#90a4ae' : reading.deviationMm === 0 ? '#2e7d32' : '#ed6c02'">
+                    {{ reading.inControl ? formatMm(reading.deviationMm) : '—' }}
                   </td>
-                  <td [style.color]="reading.stressAlert ? '#c62828' : '#2e7d32'">
+                  <td [style.color]="!reading.inControl ? '#90a4ae' : reading.stressAlert ? '#c62828' : '#2e7d32'">
                     {{ formatStress(reading.stressMpa) }}
                   </td>
                   <td>{{ reading.recordedAt }}</td>
                   <td>{{ reading.operator }}</td>
+                  <td>
+                    <span class="gb-hint" [style.color]="reading.inControl ? '#1565c0' : '#90a4ae'">
+                      {{ reading.controlLabel }}
+                    </span>
+                  </td>
                   <td>
                     <mat-chip-set>
                       <mat-chip [style.background]="readingColor(reading)" [style.color]="'#fff'">
@@ -327,6 +360,8 @@ export class ReadingEntryPage {
   readonly ROUTES = ROUTES;
   readonly syncRequirementLabel = SYNC_REQUIREMENT_LABEL;
   readonly stepStateLabel = STEP_STATE_LABEL;
+  readonly controlModes = CONTROL_MODES;
+  readonly controlModeLabel = CONTROL_MODE_LABEL;
   readonly stressAlert = STRESS_ALERT_MPA;
   readonly formatMm = formatMm;
   readonly formatStress = formatStress;
@@ -343,6 +378,10 @@ export class ReadingEntryPage {
     this.store.select((state) => state.step.readings),
     { initialValue: [] as ReadingRow[] },
   );
+  private readonly readingBatches: Signal<ReadingBatchRow[]> = toSignal(
+    this.store.select((state) => state.step.readingBatches),
+    { initialValue: [] as ReadingBatchRow[] },
+  );
 
   readonly stats = toSignal(this.store.select(selectStepStats), {
     initialValue: {
@@ -352,12 +391,13 @@ export class ReadingEntryPage {
       lifting: 0,
       idle: 0,
       readingCount: 0,
+      effectiveReadingCount: 0,
       maxLimitMm: 0,
     },
   });
 
   readonly stepViews: Signal<StepView[]> = computed(() =>
-    buildStepViews(this.steps(), this.readings(), this.bridges()),
+    buildStepViews(this.steps(), this.readings(), this.readingBatches(), this.bridges()),
   );
 
   readonly keyword = signal('');
@@ -368,6 +408,8 @@ export class ReadingEntryPage {
   readonly operator = signal('陈立强');
   /** 记录时间（datetime-local 口径 yyyy-MM-ddTHH:mm） */
   readonly recordedAt = signal(nowDateTime().replace(' ', 'T'));
+  /** 本批提交口径：现场告警盯最新状态，默认本批为准 */
+  readonly controlMode = signal<ControlMode>('batch');
 
   readonly selects = computed<FilterSelectSpec[]>(() => [
     {
@@ -375,32 +417,39 @@ export class ReadingEntryPage {
       label: '顶升步骤',
       options: this.stepViews().map((step) => `#${step.seq} ${step.bridgeName}`),
     },
-    { key: 'level', label: '判定', options: ['正常', '关注', '超限'] },
+    { key: 'level', label: '判定', options: ['正常', '关注', '超限', '留档'] },
   ]);
 
-  /** 读数视图：带步骤上下文与相对偏差 */
+  /** 读数视图：带步骤上下文、控制批口径下的相对偏差与留档标记 */
   readonly readingViews: Signal<ReadingView[]> = computed(() => {
     const steps = new Map(this.stepViews().map((step) => [step.id, step]));
-    return this.readings()
-      .map((reading) => {
-        const step = steps.get(reading.stepId);
-        const sameRound = this.readings().filter(
-          (item) => item.stepId === reading.stepId && item.recordedAt === reading.recordedAt,
-        );
-        const average = meanDisplacement(sameRound);
-        const limitMm = step?.limitMm ?? 0;
-        return {
-          ...reading,
-          stepSeq: step?.seq ?? 0,
-          bridgeId: step?.bridgeId ?? '',
-          bridgeName: step?.bridgeName ?? '未归属桥梁',
-          syncRequirement: step ? SYNC_REQUIREMENT_LABEL[step.syncRequirement] : '-',
-          deviationMm: Number((reading.displacementMm - average).toFixed(3)),
-          overLimit: limitMm > 0 && Math.abs(reading.displacementMm) >= limitMm,
-          stressAlert: reading.stressMpa >= STRESS_ALERT_MPA,
-        };
-      })
-      .sort((a, b) => (a.stepSeq === b.stepSeq ? b.recordedAt.localeCompare(a.recordedAt) : a.stepSeq - b.stepSeq));
+    return this.steps().flatMap((stepRow) => {
+      const step = steps.get(stepRow.id);
+      const partition = partitionStepReadings(stepRow.id, this.readings(), this.readingBatches());
+      const effectiveIds = new Set(partition.effective.map((item) => item.id));
+      const average = meanDisplacement(partition.effective);
+      const limitMm = step?.limitMm ?? stepRow.limitMm;
+      const caliber = partition.legacy
+        ? '旧步骤全部读数'
+        : CONTROL_MODE_LABEL[partition.controlBatch!.mode];
+      return this.readings()
+        .filter((reading) => reading.stepId === stepRow.id)
+        .map((reading) => {
+          const inControl = effectiveIds.has(reading.id);
+          return {
+            ...reading,
+            stepSeq: step?.seq ?? stepRow.seq,
+            bridgeId: step?.bridgeId ?? stepRow.bridgeId,
+            bridgeName: step?.bridgeName ?? '未归属桥梁',
+            syncRequirement: step ? SYNC_REQUIREMENT_LABEL[step.syncRequirement] : '-',
+            deviationMm: inControl ? Number((reading.displacementMm - average).toFixed(3)) : 0,
+            overLimit: inControl && limitMm > 0 && Math.abs(reading.displacementMm) >= limitMm,
+            stressAlert: inControl && reading.stressMpa >= STRESS_ALERT_MPA,
+            inControl,
+            controlLabel: inControl ? caliber : '已留档',
+          };
+        });
+    }).sort((a, b) => (a.stepSeq === b.stepSeq ? b.recordedAt.localeCompare(a.recordedAt) : a.stepSeq - b.stepSeq));
   });
 
   readonly filtered = computed(() => {
@@ -419,21 +468,43 @@ export class ReadingEntryPage {
     this.stepViews().find((step) => step.id === this.selectedStepId()) ?? null,
   );
 
-  readonly currentAverage = computed(() => {
+  /** 当前步骤在控制批口径下参与计算的读数 */
+  readonly effectiveRows = computed(() => {
     const step = this.selectedStep();
-    if (!step) return 0;
-    return meanDisplacement(this.readings().filter((item) => item.stepId === step.id));
+    if (!step) return [];
+    return partitionStepReadings(step.id, this.readings(), this.readingBatches()).effective;
   });
 
-  readonly currentDeviation = computed(() => {
+  /** 当前步骤的控制批口径说明 */
+  readonly currentCaliberText = computed(() => {
     const step = this.selectedStep();
-    if (!step) return 0;
-    return syncDeviationMm(this.readings().filter((item) => item.stepId === step.id));
+    if (!step) return '未选择步骤';
+    if (step.controlMode === null) return '旧步骤：沿用全部读数';
+    const at = step.controlBatchAt ? `（当前批 ${step.controlBatchAt}）` : '';
+    return `${CONTROL_MODE_LABEL[step.controlMode]}${at}：${step.effectiveReadingCount} 条参与 / ${
+      step.readingCount - step.effectiveReadingCount
+    } 条留档`;
   });
 
-  readonly exceedCount = computed(() =>
-    this.readingViews().filter((reading) => reading.overLimit || reading.stressAlert).length,
-  );
+  readonly currentAverage = computed(() => meanDisplacement(this.effectiveRows()));
+
+  readonly currentDeviation = computed(() => syncDeviationMm(this.effectiveRows()));
+
+  readonly exceedCount = computed(() => {
+    let count = 0;
+    for (const step of this.stepViews()) {
+      const partition = partitionStepReadings(step.id, this.readings(), this.readingBatches());
+      for (const reading of partition.effective) {
+        if (
+          (step.limitMm > 0 && Math.abs(reading.displacementMm) >= step.limitMm) ||
+          reading.stressMpa >= STRESS_ALERT_MPA
+        ) {
+          count += 1;
+        }
+      }
+    }
+    return count;
+  });
 
   readonly batchAverage = computed(() => meanDisplacement(this.batchRows()));
   readonly batchDeviation = computed(() => syncDeviationMm(this.batchRows()));
@@ -471,6 +542,10 @@ export class ReadingEntryPage {
   dateHint(): string {
     const step = this.selectedStep();
     return readingDateHint(this.recordedAt().replace('T', ' '), step?.state ?? 'idle');
+  }
+
+  controlModeHint(): string {
+    return CONTROL_MODE_HINT[this.controlMode()];
   }
 
   onStepChange(stepId: string): void {
@@ -550,12 +625,14 @@ export class ReadingEntryPage {
   }
 
   readingLevelText(reading: ReadingView): string {
+    if (!reading.inControl) return '留档';
     const step = this.selectedStep();
     const limitMm = this.stepViews().find((item) => item.id === reading.stepId)?.limitMm ?? step?.limitMm ?? 0;
     return TOLERANCE_LEVEL_LABEL[overallLevel(reading.displacementMm, limitMm, reading.stressMpa)];
   }
 
   readingColor(reading: ReadingView): string {
+    if (!reading.inControl) return '#90a4ae';
     const limitMm = this.stepViews().find((item) => item.id === reading.stepId)?.limitMm ?? 0;
     return TOLERANCE_HEX[overallLevel(reading.displacementMm, limitMm, reading.stressMpa)];
   }
@@ -565,28 +642,52 @@ export class ReadingEntryPage {
     const rows = this.batchRows();
     if (!step || rows.length === 0) return;
     const recorded = this.recordedAt().replace('T', ' ');
-    const payload = rows.map((row) => ({
+    const mode = this.controlMode();
+    const batchId = newId('batch');
+    const meta = rowMeta();
+    const payload: ReadingRow[] = rows.map((row) => ({
+      id: newId('read'),
       stepId: step.id,
       pointCode: row.pointCode,
       displacementMm: row.displacementMm,
       stressMpa: row.stressMpa,
       recordedAt: recorded,
       operator: this.operator(),
+      batchId,
+      ...meta,
     }));
-    await putReadings(
-      payload.map((row) => ({ ...row, id: newId('read'), ...rowMeta() })),
-    );
+    const batch: ReadingBatchRow = {
+      id: batchId,
+      stepId: step.id,
+      recordedAt: recorded,
+      operator: this.operator(),
+      mode,
+      readingCount: payload.length,
+      ...meta,
+    };
+    await submitReadingBatch({ batch, readings: payload });
     this.idb.emitChange();
+    // 是否成为当前控制批：记录时间晚于（或等于）既有最新批即可；补录旧时间只留档不顶批
+    const previousLatest = this.stepViews().find((item) => item.id === step.id)?.controlBatchAt ?? null;
+    const becomesControl = previousLatest === null || recorded >= previousLatest;
+    const effectText =
+      mode === 'batch'
+        ? becomesControl
+          ? '本批为当前控制批，告警 / 校验 / 到位签署只看本批，历史读数仅留档'
+          : '记录时间早于当前控制批，本批仅留档可查，不顶掉当前批，告警与签署不变'
+        : '本批并入历史，各测点按最新一条记录参与，补录的旧读数不会覆盖最新值';
     this.snackBar.open(
-      `已录入 ${payload.length} 条读数，同步偏差 ${formatMm(syncDeviationMm(rows))}`,
+      `已按「${CONTROL_MODE_LABEL[mode]}」提交 ${payload.length} 条读数，本批同步偏差 ${formatMm(
+        syncDeviationMm(rows),
+      )}；${effectText}`,
       '关闭',
-      { duration: 3000 },
+      { duration: 4200 },
     );
   }
 
   async deleteReading(reading: ReadingView): Promise<void> {
-    if (!confirm(`确认删除测点 ${reading.pointCode} 的读数？`)) return;
-    await this.idb.database.readings.delete(reading.id);
+    if (!confirm(`确认删除测点 ${reading.pointCode} 的读数？若为当前控制批最后一条，将回退到上一控制批。`)) return;
+    await removeReadingWithBatch(reading.id);
     this.idb.emitChange();
     this.snackBar.open('测点读数已删除', '关闭', { duration: 2400 });
   }

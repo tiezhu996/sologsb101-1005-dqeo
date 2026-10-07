@@ -9,6 +9,7 @@ import type {
   BearingRow,
   BridgeRow,
   PierRow,
+  ReadingBatchRow,
   ReadingRow,
   StepRow,
 } from '../utils/db';
@@ -23,6 +24,7 @@ export const appDataLoaded = createAction(
     bearings: BearingRow[];
     steps: StepRow[];
     readings: ReadingRow[];
+    readingBatches: ReadingBatchRow[];
     acceptances: AcceptanceRow[];
   }>(),
 );

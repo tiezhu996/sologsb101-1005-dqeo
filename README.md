@@ -27,6 +27,7 @@ docker compose up -d --build # 代码改动后重建
 - 登记支座并按完好 / 轻微 / 较重 / 严重四级评定病害，较重及以上触发更换建议，支持批量调级与升级
 - 编排分级顶升步骤（目标顶升量、同步要求、限位值、负责人），支持上移 / 下移调序与**累计顶升量校验**
 - 按步骤批量录入多测点位移与应力，实时计算**同步偏差**（同批次极差）并按限位值给出告警
+- **控制批口径**：每次提交由记录人选用「本批为准」（默认，现场告警盯最新批，旧读数仅留档）或「并入历史」（每测点按最新记录参与）；同步偏差、限位告警、步骤校验与顶升到位签署随控制批统一更新，补录旧时间只留档不顶掉当前批，旧步骤沿用全部读数
 - 四步签署验收（顶升到位 → 支座就位 → 落梁 → 竣工），全部支座合格后可执行竣工归档
 - 查看 IndexedDB 结构版本并导出 / 导入整库 JSON
 
@@ -80,7 +81,7 @@ sologsb101-1005/
             ├── app.component.ts          # 应用外壳（工具栏 + 侧边导航 + 统计）
             ├── app.config.ts             # provideRouter / provideStore / provideEffects
             ├── core/
-            │   ├── types/                # bridge.ts pier.ts bearing.ts step.ts reading.ts acceptance.ts persistence.ts
+            │   ├── types/                # bridge.ts pier.ts bearing.ts step.ts reading.ts control-batch.ts acceptance.ts persistence.ts
             │   ├── store/                # app.actions.ts notice.reducer.ts archive.helper.ts
             │   │                         # bridge.store/reducer/selectors、bearing.*、step.*、acceptance.*、app.effects.ts
             │   ├── services/             # idb-table.service.ts step-timeline.service.ts change-bus.service.ts
@@ -98,7 +99,7 @@ sologsb101-1005/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbbridgebear`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`core/utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `span → spanCombo`、`grade → diseaseGrade`、`syncType → syncRequirement`、`limit → limitMm`，新增 `settings` 表）。
+- **数据结构版本**：`core/utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2（补齐行修订号、迁移 `span → spanCombo`、`grade → diseaseGrade`、`syncType → syncRequirement`、`limit → limitMm`，新增 `settings` 表）与 v2 → v3（新增 `readingBatches` 控制批表、读数补 `batchId` 索引；旧数据不补批，旧步骤沿用全部读数）的 `upgrade` 迁移。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -107,7 +108,8 @@ sologsb101-1005/
   | `piers` | 墩台 | id / bridgeId / code / capElevation / [bridgeId+code] |
   | `bearings` | 支座 | id / pierId / diseaseGrade / type / serial / [pierId+serial] |
   | `steps` | 顶升步骤 | id / bridgeId / seq / state / syncRequirement / [bridgeId+seq] |
-  | `readings` | 测点读数 | id / stepId / pointCode / recordedAt / [stepId+pointCode] |
+  | `readingBatches` | 控制批 | id / stepId / recordedAt / mode / [stepId+recordedAt] |
+  | `readings` | 测点读数 | id / stepId / pointCode / recordedAt / batchId / [stepId+pointCode] / [stepId+batchId] |
   | `acceptances` | 分步验收 | id / bearingId / stage / conclusion / [bearingId+stage] |
   | `settings` | 自定义字典 | id |
 

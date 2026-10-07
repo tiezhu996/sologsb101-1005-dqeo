@@ -36,8 +36,7 @@ import {
 } from '../../../core/store/acceptance.selectors';
 import { selectBridges, selectPiers } from '../../../core/store/bridge.selectors';
 import { selectBearings } from '../../../core/store/bearing.selectors';
-import { selectStepStats } from '../../../core/store/step.selectors';
-import { selectStepState } from '../../../core/store/step.selectors';
+import { liftedGateForBridge, selectStepStats, selectStepState } from '../../../core/store/step.selectors';
 import { bridgeActions } from '../../../core/store/bridge.actions';
 import {
   DB_NAME,
@@ -262,10 +261,25 @@ import type {
                       }
                     </div>
                   </td>
-                  <td class="gb-hint">{{ summaryOf(row.id) }}</td>
+                  <td class="gb-hint">
+                    {{ summaryOf(row.id) }}
+                    @if (!passed(row.id, 'lifted')) {
+                      <div [style.color]="canLiftedSign(row.id) ? '#2e7d32' : '#c62828'">
+                        {{ liftedGateText(row.id) }}
+                      </div>
+                    }
+                  </td>
                   <td>
                     <div class="gb-row-actions">
-                      <button mat-button color="primary" (click)="signOne(row.id, 'lifted')">顶升到位</button>
+                      <button
+                        mat-button
+                        color="primary"
+                        [disabled]="!canLiftedSign(row.id)"
+                        [matTooltip]="liftedGateText(row.id)"
+                        (click)="signOne(row.id, 'lifted')"
+                      >
+                        顶升到位
+                      </button>
                       <button mat-button (click)="signOne(row.id, 'bearingPlaced')">支座就位</button>
                       <button mat-button (click)="signOne(row.id, 'beamLowered')">落梁</button>
                       <button mat-button (click)="signOne(row.id, 'completed')">竣工</button>
@@ -438,6 +452,14 @@ export class AcceptanceArchivePage {
     this.store.select((state) => state.acceptance.acceptances),
     { initialValue: [] as AcceptanceRow[] },
   );
+  private readonly stepRows: Signal<import('../../../core/utils/db').StepRow[]> = toSignal(
+    this.store.select((state) => state.step.steps),
+    { initialValue: [] as import('../../../core/utils/db').StepRow[] },
+  );
+  private readonly readingRows: Signal<import('../../../core/utils/db').ReadingRow[]> = toSignal(
+    this.store.select((state) => state.step.readings),
+    { initialValue: [] as import('../../../core/utils/db').ReadingRow[] },
+  );
   private readonly counts = toSignal(this.idb.countAll$(), { initialValue: {} as Record<string, number> });
 
   readonly stats = toSignal(this.store.select(selectAcceptanceStats), {
@@ -576,7 +598,12 @@ export class AcceptanceArchivePage {
     const passedStages = ACCEPTANCE_STAGES.filter((stage) =>
       this.selected().some((bearingId) => this.passed(bearingId, stage)),
     );
-    return stageOrderHint(this.batchStage(), passedStages);
+    const orderHint = stageOrderHint(this.batchStage(), passedStages);
+    if (this.batchStage() !== 'lifted') return orderHint;
+    if (this.selected().length === 0) return orderHint;
+    const blocked = this.selected().filter((bearingId) => !this.canLiftedSign(bearingId));
+    if (blocked.length === 0) return `${orderHint}；所选支座控制批口径（同步偏差 / 限位）均满足，可签署顶升到位`;
+    return `${orderHint}；${blocked.length} 个支座被顶升到位闸门挡住：${this.liftedGateText(blocked[0])}`;
   }
 
   archiveHintText(): string {
@@ -601,6 +628,16 @@ export class AcceptanceArchivePage {
   }
 
   signOne(bearingId: string, stage: AcceptanceStage): void {
+    if (stage === 'lifted') {
+      const bridgeId = this.bridgeIdOfBearing(bearingId);
+      if (bridgeId) {
+        const gate = liftedGateForBridge(bridgeId, this.stepRows(), this.readingRows());
+        if (!gate.canSign) {
+          this.notify(`顶升到位签署被挡住（与现场限位告警同口径）：${gate.reasons.join('；')}`);
+          return;
+        }
+      }
+    }
     this.store.dispatch(
       acceptanceActions.bulkSign({
         bearingIds: [bearingId],
@@ -616,8 +653,29 @@ export class AcceptanceArchivePage {
   }
 
   bulkSign(): void {
-    const ids = this.selected();
-    if (ids.length === 0) return;
+    const selectedIds = this.selected();
+    if (selectedIds.length === 0) return;
+    let ids = selectedIds;
+    if (this.batchStage() === 'lifted') {
+      const allowed = selectedIds.filter((bearingId) => {
+        const bridgeId = this.bridgeIdOfBearing(bearingId);
+        return bridgeId ? liftedGateForBridge(bridgeId, this.stepRows(), this.readingRows()).canSign : false;
+      });
+      const blocked = selectedIds.length - allowed.length;
+      if (allowed.length === 0) {
+        const firstBridge = this.bridgeIdOfBearing(selectedIds[0]);
+        const gate = firstBridge
+          ? liftedGateForBridge(firstBridge, this.stepRows(), this.readingRows())
+          : { reasons: ['未找到桥梁'] };
+        this.notify(`顶升到位签署全部被挡住（与现场限位告警同口径）：${gate.reasons.join('；')}`);
+        return;
+      }
+      if (blocked > 0) {
+        this.notify(`${blocked} 个支座因控制批口径未通过顶升到位闸门，已跳过`);
+        this.selected.set(allowed);
+      }
+      ids = allowed;
+    }
     this.store.dispatch(
       acceptanceActions.bulkSign({
         bearingIds: ids,
@@ -634,6 +692,26 @@ export class AcceptanceArchivePage {
         ACCEPTANCE_CONCLUSION_LABEL[this.batchConclusion()]
       }`,
     );
+  }
+
+  /** 顶升到位闸门文案（供表格行内提示） */
+  liftedGateText(bearingId: string): string {
+    const bridgeId = this.bridgeIdOfBearing(bearingId);
+    if (!bridgeId) return '';
+    const gate = liftedGateForBridge(bridgeId, this.stepRows(), this.readingRows());
+    return gate.canSign ? '控制批口径满足，可签署顶升到位' : gate.reasons.join('；');
+  }
+
+  canLiftedSign(bearingId: string): boolean {
+    const bridgeId = this.bridgeIdOfBearing(bearingId);
+    return bridgeId ? liftedGateForBridge(bridgeId, this.stepRows(), this.readingRows()).canSign : false;
+  }
+
+  /** 支座 → 桥梁 id */
+  private bridgeIdOfBearing(bearingId: string): string | null {
+    const bearing = this.bearings().find((item) => item.id === bearingId);
+    const pier = bearing ? this.piers().find((item) => item.id === bearing.pierId) : undefined;
+    return pier?.bridgeId ?? null;
   }
 
   toggleConclusion(record: AcceptanceView): void {

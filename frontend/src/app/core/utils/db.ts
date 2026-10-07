@@ -10,7 +10,7 @@ import type { Bridge } from '../types/bridge';
 import type { Pier } from '../types/pier';
 import type { Bearing, DiseaseGrade } from '../types/bearing';
 import type { Step, SyncRequirement } from '../types/step';
-import type { Reading } from '../types/reading';
+import type { BatchCaliber, Reading } from '../types/reading';
 import type { Acceptance, AcceptanceStage } from '../types/acceptance';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 
@@ -18,7 +18,7 @@ import { ROW_REVISION, type Revisioned } from '../types/persistence';
 export const DB_NAME = 'gbbridgebear';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -100,6 +100,19 @@ class BridgeBearingDatabase extends Dexie {
           if (typeof row.targetLiftMm !== 'number' && typeof row.lift === 'number') row.targetLiftMm = row.lift;
         });
       });
+
+    // v3：测点读数增加控制批（batchId / batchCaliber / submittedAt）。
+    //     不新增索引：旧读数三个字段均缺省，解析口径时自动按「旧步骤沿用全部读数」处理，
+    //     因此本版升级无需在 upgrade 中逐行改写。
+    this.version(DB_SCHEMA_VERSION).stores({
+      bridges: 'id, name, bridgeType, builtYear, roadClass, archived',
+      piers: 'id, bridgeId, code, capElevation, [bridgeId+code]',
+      bearings: 'id, pierId, diseaseGrade, type, serial, [pierId+serial]',
+      steps: 'id, bridgeId, seq, state, syncRequirement, [bridgeId+seq]',
+      readings: 'id, stepId, pointCode, recordedAt, [stepId+pointCode]',
+      acceptances: 'id, bearingId, stage, conclusion, [bearingId+stage]',
+      settings: 'id',
+    });
   }
 }
 
@@ -312,10 +325,24 @@ async function seedDatabase(): Promise<void> {
       // 未开始的步骤不产生读数
       if (stepSpec.state === 'idle') return;
       const pointCount = stepSpec.sync === 'single' ? 1 : 4;
-      const rounds = stepSpec.state === 'arrived' ? 3 : 2;
-      for (let round = 0; round < rounds; round += 1) {
+      // 控制批播种：
+      // - 早先轮次为 v3 前旧读数（无控制批，旧步骤沿用全部读数）；
+      // - 中间一轮「并入历史」提交（按每测点最新记录参与）；
+      // - 末轮「本批为准」成为控制批；到位步骤额外补录一批旧时间，演示补录不顶掉当前批。
+      const totalRounds = stepSpec.state === 'arrived' ? 3 : 2;
+      const hasBackfill = stepSpec.state === 'arrived';
+      for (let round = 0; round < totalRounds; round += 1) {
+        let batchId: string | undefined;
+        let batchCaliber: BatchCaliber | undefined;
+        let submittedAt: string | undefined;
+        if (round >= 1) {
+          batchId = `batch-${stepId}-${round + 1}`;
+          batchCaliber = round === totalRounds - 1 ? 'batch' : 'merge';
+          // 提交时间按轮次递增：越早的轮次提交越早
+          submittedAt = new Date(Date.now() - (totalRounds - round) * 3600_000).toISOString();
+        }
         for (let point = 0; point < pointCount; point += 1) {
-          const base = stepSpec.targetLiftMm * ((round + 1) / (rounds + 1));
+          const base = stepSpec.targetLiftMm * ((round + 1) / (totalRounds + 1));
           const jitter = (random() - 0.5) * 1.4;
           readings.push({
             id: `read-${stepId}-${round + 1}-${point + 1}`,
@@ -325,7 +352,32 @@ async function seedDatabase(): Promise<void> {
             stressMpa: Number((7 + random() * 6).toFixed(2)),
             recordedAt: dateTimeText(0, 9 + round, 5 + point * 5),
             operator: operators[(stepIndex + round) % operators.length],
-            createdAt: stamp,
+            batchId,
+            batchCaliber,
+            submittedAt,
+            createdAt: submittedAt ?? stamp,
+            revision: ROW_REVISION,
+          });
+        }
+      }
+
+      if (hasBackfill) {
+        // 补测旧时间：记录时间早于控制批，仅留档查看，不顶掉当前批
+        const backfillId = `batch-${stepId}-backfill`;
+        const submittedAt = new Date().toISOString();
+        for (let point = 0; point < pointCount; point += 1) {
+          readings.push({
+            id: `read-${stepId}-backfill-${point + 1}`,
+            stepId,
+            pointCode: `P${point + 1}`,
+            displacementMm: Number((stepSpec.targetLiftMm * 0.45 + (random() - 0.5) * 1.2).toFixed(2)),
+            stressMpa: Number((7 + random() * 6).toFixed(2)),
+            recordedAt: dateTimeText(-1, 16, 5 + point * 5),
+            operator: '李清和',
+            batchId: backfillId,
+            batchCaliber: 'batch',
+            submittedAt,
+            createdAt: submittedAt,
             revision: ROW_REVISION,
           });
         }

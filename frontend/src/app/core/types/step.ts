@@ -1,4 +1,7 @@
 import type { RowMeta } from './persistence';
+import type { EffectiveCaliber, Reading } from './reading';
+import { syncDeviationMm } from './reading';
+import { SYNC_TOLERANCE_MM, syncLevel } from '../utils/tolerance';
 
 /** 同步要求 */
 export type SyncRequirement = 'sync' | 'cross' | 'single';
@@ -63,12 +66,54 @@ export interface StepView extends Step {
   cumulativeLiftMm: number;
   /** 累计顶升量与限位值的关系 */
   overLimit: boolean;
-  /** 该步骤的测点读数条数 */
+  /** 该步骤的测点读数条数（含留档） */
   readingCount: number;
-  /** 同步偏差（mm），无读数为 null */
+  /** 同步偏差（mm），无有效读数为 null——按当前控制批口径计算 */
   syncDeviationMm: number | null;
+  /** 当前生效口径 */
+  effectiveCaliber: EffectiveCaliber;
+  /** 生效读数条数（旧步骤沿用全部读数） */
+  effectiveReadingCount: number;
+  /** 留档但不生效的旧批 / 旧读数条数 */
+  archivedReadingCount: number;
+  /** 生效读数中是否存在位移超限位 */
+  readingOverLimit: boolean;
   /** 校验结论文案 */
   validation: string;
+}
+
+/** 顶升到位签署闸门：步骤级（同步偏差、限位告警、步骤校验随控制批更新） */
+export interface LiftedGate {
+  /** 是否可签署顶升到位 */
+  canSign: boolean;
+  /** 阻断 / 允许原因 */
+  reasons: string[];
+}
+
+/**
+ * 步骤是否满足「顶升到位」签署条件（与现场告警同口径，取当前控制批有效读数）：
+ * 1. 步骤已推进到「已到位」；
+ * 2. 有有效读数且同步偏差不超过允许值；
+ * 3. 有效读数无位移超限位。
+ */
+export function liftedGateForStep(step: Step, effectiveReadings: Reading[]): LiftedGate {
+  const reasons: string[] = [];
+  if (step.state !== 'arrived') reasons.push(`步骤 #${step.seq} 尚未推进到「已到位」`);
+  if (effectiveReadings.length === 0) {
+    reasons.push(`步骤 #${step.seq} 缺少有效测点读数`);
+  } else {
+    const deviation = syncDeviationMm(effectiveReadings);
+    if (syncLevel(deviation) === 'exceed') {
+      reasons.push(`步骤 #${step.seq} 同步偏差 ${deviation.toFixed(2)} mm 超过允许值 ${SYNC_TOLERANCE_MM} mm`);
+    }
+    const over = effectiveReadings.find((item) => step.limitMm > 0 && Math.abs(item.displacementMm) >= step.limitMm);
+    if (over) {
+      reasons.push(
+        `步骤 #${step.seq} 测点 ${over.pointCode} 位移 ${over.displacementMm} mm 达到 / 超过限位 ${step.limitMm} mm`,
+      );
+    }
+  }
+  return { canSign: reasons.length === 0, reasons };
 }
 
 /** 步骤排序 */

@@ -29,6 +29,7 @@ import {
   type SyncRequirement,
 } from '../../../core/types/step';
 import { ROUTES } from '../../../core/router/app.routes';
+import { EFFECTIVE_CALIBER_LABEL } from '../../../core/types/reading';
 import { stepActions } from '../../../core/store/step.actions';
 import {
   buildStepViews,
@@ -195,7 +196,7 @@ export class StepDialogComponent {
         [value]="stats().readingCount"
         [suffix]="'条'"
         color="#3949ab"
-        hint="同步偏差按步骤内读数极差计算"
+        hint="同步偏差按当前控制批有效读数极差计算"
       />
     </div>
 
@@ -266,12 +267,13 @@ export class StepDialogComponent {
                   </mat-chip-set>
                 </td>
                 <td>
-                  {{ step.readingCount }} 条
+                  {{ step.effectiveReadingCount }} / {{ step.readingCount }} 条生效
                   @if (step.syncDeviationMm !== null) {
                     <span [style.color]="levelColor(step)">
                       / 偏差 {{ formatMm(step.syncDeviationMm) }}（{{ levelLabel(step) }}）
                     </span>
                   }
+                  <div class="gb-hint">口径：{{ caliberLabel(step) }}{{ step.archivedReadingCount > 0 ? ' · ' + step.archivedReadingCount + ' 条留档' : '' }}</div>
                 </td>
                 <td class="gb-hint">{{ step.validation }}</td>
                 <td>
@@ -486,6 +488,10 @@ export class StepPlanPage {
   levelLabel(step: StepView): string {
     const level = this.syncLevels()[step.id] ?? 'ok';
     return TOLERANCE_LEVEL_LABEL[level];
+  }
+
+  caliberLabel(step: StepView): string {
+    return EFFECTIVE_CALIBER_LABEL[step.effectiveCaliber];
   }
 
   go(path: string): void {

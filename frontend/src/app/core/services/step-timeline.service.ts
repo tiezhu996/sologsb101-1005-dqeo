@@ -9,7 +9,13 @@ import { IdbTableService } from './idb-table.service';
 import { listBearings, listBridges, listReadings, listSteps } from '../utils/db';
 import type { BridgeRow, BearingRow, ReadingRow, StepRow } from '../utils/db';
 import { sortSteps, SYNC_REQUIREMENT_LABEL, type StepView } from '../types/step';
-import { meanDisplacement, syncDeviationMm, type ReadingView } from '../types/reading';
+import {
+  meanDisplacement,
+  readingCaliberTag,
+  resolveStepCaliber,
+  syncDeviationMm,
+  type ReadingView,
+} from '../types/reading';
 import { overallLevel, syncLevel, type ToleranceLevel } from '../utils/tolerance';
 
 /** 步骤时间线的一级节点 */
@@ -65,35 +71,40 @@ export class StepTimelineService {
     map(([steps, snapshot]) => {
       const bridges = new Map(snapshot.bridges.map((item) => [item.id, item.name]));
       return steps.map((step) => {
+        const resolved = resolveStepCaliber(
+          snapshot.readings.filter((item) => item.stepId === step.id),
+        );
+        const effective = resolved.effectiveReadings;
+        const effectiveIds = new Set(effective.map((item) => item.id));
+        const average = meanDisplacement(effective);
         const stepReadings = snapshot.readings
           .filter((item) => item.stepId === step.id)
           .sort((a, b) => a.recordedAt.localeCompare(b.recordedAt))
-          .map<ReadingView>((reading) => {
-            const sameRound = snapshot.readings.filter(
-              (item) => item.stepId === reading.stepId && item.recordedAt === reading.recordedAt,
-            );
-            const average = meanDisplacement(sameRound);
-            return {
-              ...reading,
-              stepSeq: step.seq,
-              bridgeId: step.bridgeId,
-              bridgeName: bridges.get(step.bridgeId) ?? '未归属桥梁',
-              syncRequirement: SYNC_REQUIREMENT_LABEL[step.syncRequirement],
-              deviationMm: Number((reading.displacementMm - average).toFixed(3)),
-              overLimit: Math.abs(reading.displacementMm) >= step.limitMm,
-              stressAlert: reading.stressMpa >= 12,
-            };
-          });
+          .map<ReadingView>((reading) => ({
+            ...reading,
+            stepSeq: step.seq,
+            bridgeId: step.bridgeId,
+            bridgeName: bridges.get(step.bridgeId) ?? '未归属桥梁',
+            syncRequirement: SYNC_REQUIREMENT_LABEL[step.syncRequirement],
+            deviationMm: Number((reading.displacementMm - average).toFixed(3)),
+            overLimit: Math.abs(reading.displacementMm) >= step.limitMm,
+            stressAlert: reading.stressMpa >= 12,
+            effective: effectiveIds.has(reading.id),
+            stepCaliber: resolved.caliber,
+            caliberTag: readingCaliberTag(reading, resolved),
+          }));
         return {
           step,
           readings: stepReadings,
           deviationLevel: syncLevel(step.syncDeviationMm ?? 0),
-          limitLevel: stepReadings.reduce<ToleranceLevel>((worst, reading) => {
-            const level = overallLevel(reading.displacementMm, step.limitMm, reading.stressMpa);
-            if (level === 'exceed' || worst === 'exceed') return 'exceed';
-            if (level === 'watch' || worst === 'watch') return 'watch';
-            return 'ok';
-          }, 'ok'),
+          limitLevel: stepReadings
+            .filter((reading) => reading.effective)
+            .reduce<ToleranceLevel>((worst, reading) => {
+              const level = overallLevel(reading.displacementMm, step.limitMm, reading.stressMpa);
+              if (level === 'exceed' || worst === 'exceed') return 'exceed';
+              if (level === 'watch' || worst === 'watch') return 'watch';
+              return 'ok';
+            }, 'ok'),
         };
       });
     }),
@@ -126,13 +137,14 @@ export class StepTimelineService {
     shareReplay({ bufferSize: 1, refCount: true }),
   );
 
-  /** 同步偏差流：步骤 id → 偏差 */
+  /** 同步偏差流：步骤 id → 偏差（当前控制批口径） */
   readonly syncDeviation$: Observable<Record<string, number>> = this.snapshot$.pipe(
     map((snapshot) => {
       const result: Record<string, number> = {};
       for (const step of snapshot.steps) {
         const rows = snapshot.readings.filter((item) => item.stepId === step.id);
-        result[step.id] = syncDeviationMm(rows);
+        const resolved = resolveStepCaliber(rows);
+        result[step.id] = syncDeviationMm(resolved.effectiveReadings);
       }
       return result;
     }),
@@ -150,22 +162,33 @@ export class StepTimelineService {
       cumulative.set(step.id, Number(running.toFixed(2)));
     }
     return ordered.map((step) => {
-      const rows = snapshot.readings.filter((item) => item.stepId === step.id);
+      const resolved = resolveStepCaliber(snapshot.readings.filter((item) => item.stepId === step.id));
+      const effective = resolved.effectiveReadings;
       const cumulativeLiftMm = cumulative.get(step.id) ?? step.targetLiftMm;
-      const deviation = rows.length > 0 ? syncDeviationMm(rows) : null;
+      const deviation = effective.length > 0 ? syncDeviationMm(effective) : null;
       const overLimit = cumulativeLiftMm > step.limitMm;
+      const readingOverLimit = effective.some(
+        (item) => step.limitMm > 0 && Math.abs(item.displacementMm) >= step.limitMm,
+      );
       return {
         ...step,
         bridgeName: bridgeName.get(step.bridgeId) ?? '未归属桥梁',
         cumulativeLiftMm,
         overLimit,
-        readingCount: rows.length,
+        readingCount: snapshot.readings.filter((item) => item.stepId === step.id).length,
         syncDeviationMm: deviation,
+        effectiveCaliber: resolved.caliber,
+        effectiveReadingCount: effective.length,
+        archivedReadingCount:
+          snapshot.readings.filter((item) => item.stepId === step.id).length - effective.length,
+        readingOverLimit,
         validation: overLimit
           ? `累计顶升量 ${cumulativeLiftMm} mm 已超过限位 ${step.limitMm} mm，需立即停止并复核`
-          : deviation !== null && syncLevel(deviation) === 'exceed'
-            ? `同步偏差 ${deviation.toFixed(2)} mm 超允许值，需调平后继续`
-            : '顶升参数与监测数据均在控制范围内',
+          : readingOverLimit
+            ? `生效读数位移达到 / 超过限位 ${step.limitMm} mm，立即停止顶升`
+            : deviation !== null && syncLevel(deviation) === 'exceed'
+              ? `同步偏差 ${deviation.toFixed(2)} mm 超允许值，需调平后继续`
+              : '顶升参数与监测数据均在控制范围内',
       };
     });
   }

@@ -26,8 +26,9 @@ docker compose up -d --build # 代码改动后重建
 - 建立桥梁与墩台台账（跨径组合、桥型、建成年、公路等级、盖梁标高）
 - 登记支座并按完好 / 轻微 / 较重 / 严重四级评定病害，较重及以上触发更换建议，支持批量调级与升级
 - 编排分级顶升步骤（目标顶升量、同步要求、限位值、负责人），支持上移 / 下移调序与**累计顶升量校验**
-- 按步骤批量录入多测点位移与应力，实时计算**同步偏差**（同批次极差）并按限位值给出告警
-- 四步签署验收（顶升到位 → 支座就位 → 落梁 → 竣工），全部支座合格后可执行竣工归档
+- 按步骤批量录入多测点位移与应力，每次提交由记录人选择**控制批口径**：默认「本批为准」（最新批参与同步偏差 / 限位告警 / 步骤校验 / 顶升到位签署，旧读数只留档；补录旧时间可查看但不顶掉当前批），可选「并入历史」（每个测点按最新记录参与）；v3 前的旧步骤沿用全部读数
+- 实时计算**同步偏差**（当前控制批有效读数极差）并按限位值给出告警，口径统一贯穿限位告警、步骤校验与「顶升到位」签署闸门，避免口径混用导致告警与验收结论相反
+- 四步签署验收（顶升到位 → 支座就位 → 落梁 → 竣工），顶升到位签署随控制批更新闸门，全部支座合格后可执行竣工归档
 - 查看 IndexedDB 结构版本并导出 / 导入整库 JSON
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
@@ -98,7 +99,7 @@ sologsb101-1005/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbbridgebear`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`core/utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `span → spanCombo`、`grade → diseaseGrade`、`syncType → syncRequirement`、`limit → limitMm`，新增 `settings` 表）。
+- **数据结构版本**：`core/utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2、v2 → v3 的版本迁移：v2 补齐行修订号、迁移 `span → spanCombo`、`grade → diseaseGrade`、`syncType → syncRequirement`、`limit → limitMm`，新增 `settings` 表；v3 测点读数增加控制批字段（`batchId` / `batchCaliber` / `submittedAt`，不新增索引，旧读数缺省即按「旧步骤沿用全部读数」处理，故 v3 升级无需逐行改写）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -107,7 +108,7 @@ sologsb101-1005/
   | `piers` | 墩台 | id / bridgeId / code / capElevation / [bridgeId+code] |
   | `bearings` | 支座 | id / pierId / diseaseGrade / type / serial / [pierId+serial] |
   | `steps` | 顶升步骤 | id / bridgeId / seq / state / syncRequirement / [bridgeId+seq] |
-  | `readings` | 测点读数 | id / stepId / pointCode / recordedAt / [stepId+pointCode] |
+  | `readings` | 测点读数 | id / stepId / pointCode / recordedAt / [stepId+pointCode]；控制批字段 batchId / batchCaliber / submittedAt |
   | `acceptances` | 分步验收 | id / bearingId / stage / conclusion / [bearingId+stage] |
   | `settings` | 自定义字典 | id |
 

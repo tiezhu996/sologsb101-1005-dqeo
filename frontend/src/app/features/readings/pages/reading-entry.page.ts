@@ -10,24 +10,30 @@ import { MatChipsModule } from '@angular/material/chips';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
+import { MatButtonToggleModule } from '@angular/material/button-toggle';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { STEP_STATE_LABEL, SYNC_REQUIREMENT_LABEL, type StepView } from '../../../core/types/step';
 import {
-  POINT_CODES,
+  BATCH_CALIBER_LABEL,
+  EFFECTIVE_CALIBER_LABEL,
   STRESS_ALERT_MPA,
   meanDisplacement,
+  readingCaliberTag,
   readingDateHint,
+  resolveStepCaliber,
   suggestPointCodes,
   syncDeviationMm,
+  type BatchCaliber,
   type ReadingView,
+  type StepCaliberResult,
 } from '../../../core/types/reading';
 import { ROUTES } from '../../../core/router/app.routes';
 import { stepActions } from '../../../core/store/step.actions';
 import { buildStepViews, selectStepStats } from '../../../core/store/step.selectors';
 import { selectBridges } from '../../../core/store/bridge.selectors';
 import { IdbTableService } from '../../../core/services/idb-table.service';
-import { putReadings, rowMeta, newId, type ReadingRow } from '../../../core/utils/db';
+import { putReadings, rowMeta, newId } from '../../../core/utils/db';
 import { formatMm, formatStress } from '../../../core/utils/unit';
 import {
   TOLERANCE_HEX,
@@ -40,7 +46,7 @@ import { nowDateTime } from '../../../core/utils/export';
 import { StatBadgeComponent } from '../../../shared/components/common/stat-badge.component';
 import { EmptyPanelComponent } from '../../../shared/components/common/empty-panel.component';
 import { FilterBarComponent, type FilterSelectSpec } from '../../../shared/components/common/filter-bar.component';
-import type { BridgeRow, StepRow } from '../../../core/utils/db';
+import type { BridgeRow, ReadingRow, StepRow } from '../../../core/utils/db';
 import type { ToleranceLevel } from '../../../core/utils/tolerance';
 
 /** 批量录入的临时行 */
@@ -69,6 +75,7 @@ interface BatchRow {
     MatSelectModule,
     MatSnackBarModule,
     MatTooltipModule,
+    MatButtonToggleModule,
     StatBadgeComponent,
     EmptyPanelComponent,
     FilterBarComponent,
@@ -106,14 +113,14 @@ interface BatchRow {
         [value]="formatMm(currentDeviation())"
         [percent]="deviationShare()"
         [color]="syncColor()"
-        [hint]="'允许值 1.5 mm，当前 ' + syncLevelText()"
+        [hint]="'允许值 1.5 mm，当前 ' + syncLevelText() + '（' + currentCaliberLabel() + '）'"
       />
       <app-stat-badge
-        title="超限读数"
+        title="生效超限读数"
         [value]="exceedCount()"
         [suffix]="'条'"
         color="#c62828"
-        [hint]="'限位值 ' + (selectedStep()?.limitMm ?? 0) + ' mm，应力关注值 ' + stressAlert + ' MPa'"
+        [hint]="'限位值 ' + (selectedStep()?.limitMm ?? 0) + ' mm；留档读数不计告警，共 ' + archivedCount() + ' 条'"
       />
     </div>
 
@@ -166,6 +173,18 @@ interface BatchRow {
                 (ngModelChange)="recordedAt.set($event)"
               />
             </mat-form-field>
+            <mat-button-toggle-group
+              [ngModel]="batchCaliber()"
+              (ngModelChange)="batchCaliber.set($event)"
+              aria-label="控制批口径"
+            >
+              <mat-button-toggle value="batch" matTooltip="默认：本批成为控制批，旧读数只留档，告警/校验/签署盯最新批">
+                本批为准
+              </mat-button-toggle>
+              <mat-button-toggle value="merge" matTooltip="并入历史：每个测点按最新记录参与同步偏差与限位告警">
+                并入历史
+              </mat-button-toggle>
+            </mat-button-toggle-group>
             <button mat-stroked-button (click)="regenerateRows()">
               <mat-icon>autorenew</mat-icon>
               重排测点
@@ -176,6 +195,7 @@ interface BatchRow {
             </button>
           </div>
           <div class="gb-hint">{{ dateHint() }}</div>
+          <div class="gb-hint" style="margin-top: 4px">{{ caliberHint() }}</div>
 
           @if (selectedStep(); as step) {
             <div class="gb-table-wrap" style="margin-top: 10px">
@@ -230,6 +250,7 @@ interface BatchRow {
                 <div class="gb-hint">
                   本批 {{ batchRows().length }} 个测点，平均位移 {{ formatMm(batchAverage()) }}；{{ limitAlertText(batchMax(), step.limitMm) }}
                 </div>
+                <div class="gb-hint">提交口径：{{ batchCaliberLabel[batchCaliber()] }} · {{ submitCaliberHint() }}</div>
               </div>
             </div>
           } @else {
@@ -266,13 +287,14 @@ interface BatchRow {
                 <th>应力</th>
                 <th>记录时间</th>
                 <th>记录人</th>
+                <th>口径</th>
                 <th>判定</th>
                 <th style="width: 90px">操作</th>
               </tr>
             </thead>
             <tbody>
               @for (reading of filtered(); track reading.id) {
-                <tr>
+                <tr [class.is-archived]="!reading.effective">
                   <td>#{{ reading.stepSeq }}</td>
                   <td>{{ reading.bridgeName }}</td>
                   <td class="gb-mono">{{ reading.pointCode }}</td>
@@ -286,9 +308,17 @@ interface BatchRow {
                   <td>{{ reading.recordedAt }}</td>
                   <td>{{ reading.operator }}</td>
                   <td>
+                    <span class="gb-caliber-tag" [class.is-effective]="reading.effective">
+                      {{ reading.caliberTag }}
+                    </span>
+                  </td>
+                  <td>
                     <mat-chip-set>
-                      <mat-chip [style.background]="readingColor(reading)" [style.color]="'#fff'">
-                        {{ readingLevelText(reading) }}
+                      <mat-chip
+                        [style.background]="reading.effective ? readingColor(reading) : '#90a4ae'"
+                        [style.color]="'#fff'"
+                      >
+                        {{ reading.effective ? readingLevelText(reading) : '留档' }}
                       </mat-chip>
                     </mat-chip-set>
                   </td>
@@ -314,6 +344,21 @@ interface BatchRow {
         border-radius: 6px;
         font-size: 13px;
       }
+      tr.is-archived {
+        opacity: 0.55;
+      }
+      .gb-caliber-tag {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 10px;
+        font-size: 12px;
+        background: #eceff1;
+        color: #546e7a;
+      }
+      .gb-caliber-tag.is-effective {
+        background: #e3f2fd;
+        color: #0d47a1;
+      }
     `,
   ],
 })
@@ -327,6 +372,7 @@ export class ReadingEntryPage {
   readonly ROUTES = ROUTES;
   readonly syncRequirementLabel = SYNC_REQUIREMENT_LABEL;
   readonly stepStateLabel = STEP_STATE_LABEL;
+  readonly batchCaliberLabel = BATCH_CALIBER_LABEL;
   readonly stressAlert = STRESS_ALERT_MPA;
   readonly formatMm = formatMm;
   readonly formatStress = formatStress;
@@ -368,6 +414,8 @@ export class ReadingEntryPage {
   readonly operator = signal('陈立强');
   /** 记录时间（datetime-local 口径 yyyy-MM-ddTHH:mm） */
   readonly recordedAt = signal(nowDateTime().replace(' ', 'T'));
+  /** 本次提交口径：现场告警盯最新状态，默认本批为准 */
+  readonly batchCaliber = signal<BatchCaliber>('batch');
 
   readonly selects = computed<FilterSelectSpec[]>(() => [
     {
@@ -375,19 +423,34 @@ export class ReadingEntryPage {
       label: '顶升步骤',
       options: this.stepViews().map((step) => `#${step.seq} ${step.bridgeName}`),
     },
-    { key: 'level', label: '判定', options: ['正常', '关注', '超限'] },
+    { key: 'level', label: '判定', options: ['正常', '关注', '超限', '留档'] },
   ]);
 
-  /** 读数视图：带步骤上下文与相对偏差 */
+  /** 各步骤控制批口径解析结果 */
+  private readonly stepCalibers = computed(() => {
+    const map = new Map<string, ReturnType<typeof resolveStepCaliber>>();
+    for (const step of this.stepViews()) {
+      map.set(step.id, resolveStepCaliber(this.readings().filter((item) => item.stepId === step.id)));
+    }
+    return map;
+  });
+
+  /** 读数视图：带步骤上下文、相对偏差与控制批口径标记 */
   readonly readingViews: Signal<ReadingView[]> = computed(() => {
     const steps = new Map(this.stepViews().map((step) => [step.id, step]));
     return this.readings()
       .map((reading) => {
         const step = steps.get(reading.stepId);
-        const sameRound = this.readings().filter(
-          (item) => item.stepId === reading.stepId && item.recordedAt === reading.recordedAt,
-        );
-        const average = meanDisplacement(sameRound);
+        const fallback: StepCaliberResult = {
+          effectiveReadings: [] as ReadingRow[],
+          caliber: 'legacy',
+          controlBatchId: null,
+          controlSubmittedAt: null,
+          archivedBatchIds: [],
+        };
+        const resolved = this.stepCalibers().get(reading.stepId) ?? fallback;
+        const effectiveIds = new Set(resolved.effectiveReadings.map((item) => item.id));
+        const average = meanDisplacement(resolved.effectiveReadings);
         const limitMm = step?.limitMm ?? 0;
         return {
           ...reading,
@@ -398,6 +461,9 @@ export class ReadingEntryPage {
           deviationMm: Number((reading.displacementMm - average).toFixed(3)),
           overLimit: limitMm > 0 && Math.abs(reading.displacementMm) >= limitMm,
           stressAlert: reading.stressMpa >= STRESS_ALERT_MPA,
+          effective: effectiveIds.has(reading.id),
+          stepCaliber: resolved.caliber,
+          caliberTag: readingCaliberTag(reading, resolved),
         };
       })
       .sort((a, b) => (a.stepSeq === b.stepSeq ? b.recordedAt.localeCompare(a.recordedAt) : a.stepSeq - b.stepSeq));
@@ -419,21 +485,49 @@ export class ReadingEntryPage {
     this.stepViews().find((step) => step.id === this.selectedStepId()) ?? null,
   );
 
-  readonly currentAverage = computed(() => {
+  /** 当前步骤的有效读数（控制批口径） */
+  readonly currentEffective = computed(() => {
     const step = this.selectedStep();
-    if (!step) return 0;
-    return meanDisplacement(this.readings().filter((item) => item.stepId === step.id));
+    if (!step) return [];
+    return this.stepCalibers().get(step.id)?.effectiveReadings ?? [];
   });
 
-  readonly currentDeviation = computed(() => {
-    const step = this.selectedStep();
-    if (!step) return 0;
-    return syncDeviationMm(this.readings().filter((item) => item.stepId === step.id));
-  });
+  readonly currentAverage = computed(() => meanDisplacement(this.currentEffective()));
+
+  readonly currentDeviation = computed(() => syncDeviationMm(this.currentEffective()));
 
   readonly exceedCount = computed(() =>
-    this.readingViews().filter((reading) => reading.overLimit || reading.stressAlert).length,
+    this.readingViews().filter((reading) => reading.effective && (reading.overLimit || reading.stressAlert)).length,
   );
+
+  readonly archivedCount = computed(() => this.readingViews().filter((reading) => !reading.effective).length);
+
+  currentCaliberLabel(): string {
+    const step = this.selectedStep();
+    if (!step) return '-';
+    return EFFECTIVE_CALIBER_LABEL[this.stepCalibers().get(step.id)?.caliber ?? 'legacy'];
+  }
+
+  caliberHint(): string {
+    const step = this.selectedStep();
+    if (!step) return '请先选择顶升步骤';
+    const resolved = this.stepCalibers().get(step.id);
+    if (!resolved) return '';
+    const archived = this.readings().filter((item) => item.stepId === step.id).length - resolved.effectiveReadings.length;
+    if (resolved.caliber === 'batch') {
+      return `当前口径「本批为准」：控制批 ${resolved.effectiveReadings.length} 条读数参与同步偏差 / 限位告警 / 校验 / 签署，${archived} 条旧读数仅留档。`;
+    }
+    if (resolved.caliber === 'merge') {
+      return `当前口径「并入历史」：每个测点按最新记录参与，共 ${resolved.effectiveReadings.length} 条生效。`;
+    }
+    return `当前步骤为旧步骤：沿用全部 ${resolved.effectiveReadings.length} 条读数（v3 前无控制批）。`;
+  }
+
+  submitCaliberHint(): string {
+    return this.batchCaliber() === 'batch'
+      ? '本批成为控制批，旧读数只留档；补录旧时间可查看但不顶掉当前批'
+      : '与历史读数合并，每个测点取最新一条参与计算';
+  }
 
   readonly batchAverage = computed(() => meanDisplacement(this.batchRows()));
   readonly batchDeviation = computed(() => syncDeviationMm(this.batchRows()));
@@ -550,6 +644,7 @@ export class ReadingEntryPage {
   }
 
   readingLevelText(reading: ReadingView): string {
+    if (!reading.effective) return '留档';
     const step = this.selectedStep();
     const limitMm = this.stepViews().find((item) => item.id === reading.stepId)?.limitMm ?? step?.limitMm ?? 0;
     return TOLERANCE_LEVEL_LABEL[overallLevel(reading.displacementMm, limitMm, reading.stressMpa)];
@@ -565,6 +660,9 @@ export class ReadingEntryPage {
     const rows = this.batchRows();
     if (!step || rows.length === 0) return;
     const recorded = this.recordedAt().replace('T', ' ');
+    const caliber = this.batchCaliber();
+    const batchId = newId('batch');
+    const submittedAt = new Date().toISOString();
     const payload = rows.map((row) => ({
       stepId: step.id,
       pointCode: row.pointCode,
@@ -572,16 +670,38 @@ export class ReadingEntryPage {
       stressMpa: row.stressMpa,
       recordedAt: recorded,
       operator: this.operator(),
+      batchId,
+      batchCaliber: caliber,
+      submittedAt,
     }));
     await putReadings(
       payload.map((row) => ({ ...row, id: newId('read'), ...rowMeta() })),
     );
     this.idb.emitChange();
+    const backfill = this.currentControlRecordedAt() !== null && recorded < this.currentControlRecordedAt()!;
+    const caliberNote =
+      caliber === 'batch'
+        ? backfill
+          ? '补录旧时间，已留档且不顶掉当前批'
+          : '本批已成为控制批，旧读数仅留档'
+        : '已并入历史，按每个测点最新记录参与';
     this.snackBar.open(
-      `已录入 ${payload.length} 条读数，同步偏差 ${formatMm(syncDeviationMm(rows))}`,
+      `已录入 ${payload.length} 条读数（${BATCH_CALIBER_LABEL[caliber]}），同步偏差 ${formatMm(
+        syncDeviationMm(rows),
+      )}；${caliberNote}`,
       '关闭',
-      { duration: 3000 },
+      { duration: 3600 },
     );
+  }
+
+  /** 当前控制批的记录时间，用于判断本次提交是否为补录旧时间 */
+  private currentControlRecordedAt(): string | null {
+    const step = this.selectedStep();
+    if (!step) return null;
+    const batchId = this.stepCalibers().get(step.id)?.controlBatchId;
+    if (!batchId) return null;
+    const rows = this.readings().filter((item) => item.batchId === batchId);
+    return rows.reduce((min, item) => (item.recordedAt < min ? item.recordedAt : min), rows[0]?.recordedAt ?? '');
   }
 
   async deleteReading(reading: ReadingView): Promise<void> {
